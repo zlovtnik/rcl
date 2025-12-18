@@ -13,9 +13,9 @@ use anyhow::Result;
 use futures::StreamExt;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::OwnedMessage;
-use serde_json::Value;
 use rdkafka::producer::FutureProducer;
 use rdkafka::Message;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -43,24 +43,46 @@ impl ConsumerContext {
         pipeline_name: &str,
         table: &str,
         message: Value,
+        context: &MessageContext,
     ) -> Result<(), ProcessingError> {
         let mut batcher = self.batcher.lock().await;
-        batcher.add_message(pipeline_name, table, message).await
+        batcher
+            .add_message(pipeline_name, table, message, context.clone())
+            .await
     }
-}
 
-async fn handle_decode_error(
-    health: &Arc<HealthRegistry>,
-    metrics: &Metrics,
-    pipeline: &Pipeline,
-    ctx: &MessageContext,
-    error_msg: String,
-) {
-    if let Err(err) = health.update_pipeline_error(&pipeline.name, error_msg.clone()) {
-        warn!("Failed to update pipeline error status: {}", err);
+    async fn commit_offset(&self, ctx: &MessageContext) {
+        let mut tpl = TopicPartitionList::new();
+        if let Err(e) =
+            tpl.add_partition_offset(&ctx.topic, ctx.partition, Offset::Offset(ctx.offset + 1))
+        {
+            warn!("Failed to add partition offset to list: {}", e);
+            return;
+        }
+        if let Err(e) = self.consumer.commit(&tpl, CommitMode::Async) {
+            self.metrics.processing_failures.inc();
+            warn!(context = %ctx.correlation_id(), error = %e, "offset commit failed");
+        } else {
+            info!(context = %ctx.correlation_id(), "committed offset for failed message");
+        }
     }
-    metrics.decode_failures.inc();
-    warn!(context = %ctx.correlation_id(), error = %error_msg, "decode error");
+
+    async fn handle_decode_error(
+        &self,
+        pipeline: &Pipeline,
+        ctx: &MessageContext,
+        error_msg: String,
+    ) {
+        if let Err(err) = self
+            .health
+            .update_pipeline_error(&pipeline.name, error_msg.clone())
+        {
+            warn!("Failed to update pipeline error status: {}", err);
+        }
+        self.metrics.decode_failures.inc();
+        warn!(context = %ctx.correlation_id(), error = %error_msg, "decode error");
+        self.commit_offset(ctx).await;
+    }
 }
 
 impl ConsumerContext {
@@ -116,7 +138,8 @@ impl ConsumerContext {
             let table = crate::config::validate_table_identifier(candidate)
                 .map_err(|e| ProcessingError::Validation(ValidationError::new(e.to_string())))?;
 
-            self.add_to_batcher(&pipeline.name, table, msg.clone()).await?;
+            self.add_to_batcher(&pipeline.name, table, msg.clone(), ctx)
+                .await?;
         }
 
         Ok(())
@@ -170,6 +193,7 @@ impl ConsumerContext {
                 "dlq disabled; message skipped"
             );
         }
+        self.commit_offset(ctx).await;
     }
 }
 
@@ -283,16 +307,16 @@ async fn run_heartbeat_task(
 async fn run_processing_loop(
     rx: mpsc::Receiver<(MessageContext, OwnedMessage)>,
     context: ConsumerContext,
-    consumer: Arc<StreamConsumer>,
+    _consumer: Arc<StreamConsumer>,
 ) {
     let mut stream = ReceiverStream::new(rx);
-    let mut latest_offsets: HashMap<(String, i32), i64> = HashMap::new();
 
     while let Some((ctx, msg)) = stream.next().await {
         let pipeline = match context.pipelines_by_topic.get(&ctx.topic) {
             Some(p) => p,
             None => {
                 warn!(context = %ctx.correlation_id(), "no pipeline for topic");
+                context.commit_offset(&ctx).await;
                 continue;
             }
         };
@@ -300,36 +324,22 @@ async fn run_processing_loop(
         let payload = match msg.payload_view::<str>() {
             Some(Ok(p)) => p.to_string(),
             Some(Err(e)) => {
-                handle_decode_error(
-                    &context.health,
-                    &context.metrics,
-                    pipeline,
-                    &ctx,
-                    format!("utf8 decode failed: {}", e),
-                )
-                .await;
+                context
+                    .handle_decode_error(pipeline, &ctx, format!("utf8 decode failed: {}", e))
+                    .await;
                 continue;
             }
             None => {
-                handle_decode_error(
-                    &context.health,
-                    &context.metrics,
-                    pipeline,
-                    &ctx,
-                    "empty payload".to_string(),
-                )
-                .await;
+                context
+                    .handle_decode_error(pipeline, &ctx, "empty payload".to_string())
+                    .await;
                 continue;
             }
         };
 
         match context.process_message(&payload, pipeline, &ctx).await {
             Ok(_) => {
-                latest_offsets.insert((ctx.topic.clone(), ctx.partition), ctx.offset + 1);
-                if let Err(err) = commit_offset(&consumer, &ctx) {
-                    context.metrics.processing_failures.inc();
-                    warn!(context = %ctx.correlation_id(), error = %err, "offset commit failed");
-                }
+                // Message added to batcher, offset will be committed after batch write
             }
             Err(reason) => {
                 context
@@ -339,19 +349,28 @@ async fn run_processing_loop(
         }
     }
 
-    // Final commit
-    if !latest_offsets.is_empty() {
-        info!("Performing final offset commit");
+    info!("processing loop finished");
+}
+
+async fn run_committed_offsets_handler(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<HashMap<(String, i32), i64>>,
+    consumer: Arc<StreamConsumer>,
+    metrics: Metrics,
+) {
+    while let Some(committed_offsets) = rx.recv().await {
         let mut tpl = TopicPartitionList::new();
-        for ((topic, partition), offset) in latest_offsets {
+        for ((topic, partition), offset) in committed_offsets {
             if let Err(e) = tpl.add_partition_offset(&topic, partition, Offset::Offset(offset)) {
                 warn!("Failed to add partition offset to list: {}", e);
+                continue;
             }
         }
-        if let Err(e) = consumer.commit(&tpl, CommitMode::Sync) {
-            error!("Final offset commit failed: {}", e);
+
+        if let Err(e) = consumer.commit(&tpl, CommitMode::Async) {
+            metrics.processing_failures.inc();
+            warn!(error = %e, "offset commit failed");
         } else {
-            info!("Final offset commit successful");
+            info!("Committed offsets for {} partitions", tpl.count());
         }
     }
 }
@@ -396,6 +415,7 @@ pub async fn replay(
     );
 
     // For replay, we'll use the writer directly since batching isn't needed
+    let (dummy_tx, _) = tokio::sync::mpsc::unbounded_channel::<HashMap<(String, i32), i64>>();
     let context = ConsumerContext {
         consumer: Arc::new(consumer),
         batcher: Arc::new(tokio::sync::Mutex::new(Batcher::new(
@@ -403,6 +423,7 @@ pub async fn replay(
             writer.clone(),
             _metrics.clone(),
             &ShutdownCoordinator::default(),
+            dummy_tx,
         ))), // Not used in replay
         metrics: _metrics,
         health: Arc::new(HealthRegistry::new(Duration::from_secs(30))), // Not used in replay
@@ -513,6 +534,10 @@ pub async fn run(
         None
     };
 
+    // Create committed offsets channel
+    let (committed_offsets_tx, committed_offsets_rx) =
+        tokio::sync::mpsc::unbounded_channel::<HashMap<(String, i32), i64>>();
+
     // Create batcher
     let shutdown_coordinator = ShutdownCoordinator::default();
     let batcher_config = BatcherConfig::from_pipeline_config(
@@ -525,6 +550,7 @@ pub async fn run(
         writer.clone(),
         metrics.clone(),
         &shutdown_coordinator,
+        committed_offsets_tx,
     )));
 
     let (tx, rx) = mpsc::channel::<(MessageContext, OwnedMessage)>(capacity);
@@ -550,12 +576,12 @@ pub async fn run(
     let heartbeat_task = tokio::spawn(run_heartbeat_task(
         last_poll,
         health.clone(),
-        metrics,
+        metrics.clone(),
         cfg.kafka.staleness_threshold_seconds,
         shutdown_rx_heartbeat,
     ));
 
-    let processing_loop = tokio::spawn(run_processing_loop(rx, context, consumer));
+    let processing_loop = tokio::spawn(run_processing_loop(rx, context, consumer.clone()));
 
     // Spawn batcher background flush task
     let batcher_task = tokio::spawn(async move {
@@ -565,7 +591,20 @@ pub async fn run(
         }
     });
 
-    tokio::try_join!(fetch_loop, processing_loop, heartbeat_task, batcher_task)?;
+    // Spawn committed offsets handler task
+    let committed_offsets_task = tokio::spawn(run_committed_offsets_handler(
+        committed_offsets_rx,
+        consumer.clone(),
+        metrics.clone(),
+    ));
+
+    tokio::try_join!(
+        fetch_loop,
+        processing_loop,
+        heartbeat_task,
+        batcher_task,
+        committed_offsets_task
+    )?;
     info!("consumer loops stopped");
     Ok(())
 }
@@ -635,6 +674,7 @@ fn build_consumer(cfg: &KafkaConfig) -> Result<StreamConsumer> {
     Ok(consumer)
 }
 
+#[allow(dead_code)]
 fn commit_offset(
     consumer: &StreamConsumer,
     ctx: &MessageContext,

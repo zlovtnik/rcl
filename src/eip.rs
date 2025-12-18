@@ -1,5 +1,7 @@
 use crate::errors::ProcessingError;
-use crate::stages::{FilterStage, RouterStage, SplitterStage, TransformerStage, IdempotentReceiverStage};
+use crate::stages::{
+    FilterStage, IdempotentReceiverStage, RouterStage, SplitterStage, TransformerStage,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -169,6 +171,47 @@ impl Clone for Pipeline {
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct BatchingConfig {
+    #[serde(default)]
+    pub adaptive_enabled: bool,
+    #[serde(default = "BatchingConfig::default_min_batch_size")]
+    pub min_batch_size: usize,
+    #[serde(default = "BatchingConfig::default_max_batch_size")]
+    pub max_batch_size: usize,
+    #[serde(default = "BatchingConfig::default_latency_window_size")]
+    pub latency_window_size: usize,
+    #[serde(default = "BatchingConfig::default_latency_target_ms")]
+    pub latency_target_ms: u64,
+}
+
+impl Default for BatchingConfig {
+    fn default() -> Self {
+        Self {
+            adaptive_enabled: false,
+            min_batch_size: Self::default_min_batch_size(),
+            max_batch_size: Self::default_max_batch_size(),
+            latency_window_size: Self::default_latency_window_size(),
+            latency_target_ms: Self::default_latency_target_ms(),
+        }
+    }
+}
+
+impl BatchingConfig {
+    fn default_min_batch_size() -> usize {
+        100
+    }
+    fn default_max_batch_size() -> usize {
+        50000
+    }
+    fn default_latency_window_size() -> usize {
+        10
+    }
+    fn default_latency_target_ms() -> u64 {
+        1000
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct PipelineConfig {
     pub name: String,
     pub topic: String,
@@ -180,6 +223,8 @@ pub struct PipelineConfig {
     pub required_fields: Vec<String>,
     #[serde(default)]
     pub backpressure: BackpressureConfig,
+    #[serde(default)]
+    pub batching: BatchingConfig,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -270,6 +315,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn create_filter_stage() -> Box<dyn Stage> {
         let stage_def = StageDefinition {
             name: "filter".to_string(),
@@ -288,6 +334,7 @@ mod tests {
         StageFactory::create(&stage_def).unwrap()
     }
 
+    #[allow(dead_code)]
     fn create_transformer_stage() -> Box<dyn Stage> {
         let stage_def = StageDefinition {
             name: "transformer".to_string(),
@@ -305,6 +352,7 @@ mod tests {
         StageFactory::create(&stage_def).unwrap()
     }
 
+    #[allow(dead_code)]
     fn create_router_stage() -> Box<dyn Stage> {
         let stage_def = StageDefinition {
             name: "router".to_string(),
@@ -349,6 +397,7 @@ mod tests {
             backpressure: BackpressureConfig {
                 channel_capacity: 100,
             },
+            batching: Default::default(),
         };
 
         let pipeline = Pipeline::from_config(&config).unwrap();
@@ -389,6 +438,7 @@ mod tests {
             backpressure: BackpressureConfig {
                 channel_capacity: 100,
             },
+            batching: Default::default(),
         };
 
         let pipeline = Pipeline::from_config(&config).unwrap();
@@ -442,6 +492,7 @@ mod tests {
             backpressure: BackpressureConfig {
                 channel_capacity: 100,
             },
+            batching: Default::default(),
         };
 
         let pipeline = Pipeline::from_config(&config).unwrap();
@@ -496,6 +547,7 @@ mod tests {
             backpressure: BackpressureConfig {
                 channel_capacity: 100,
             },
+            batching: Default::default(),
         };
 
         let pipeline = Pipeline::from_config(&config).unwrap();
@@ -550,6 +602,7 @@ mod tests {
             backpressure: BackpressureConfig {
                 channel_capacity: 100,
             },
+            batching: Default::default(),
         };
 
         let original_pipeline = Pipeline::from_config(&config).unwrap();
@@ -558,7 +611,10 @@ mod tests {
         // Verify the cloned pipeline has the same configuration
         assert_eq!(original_pipeline.name, cloned_pipeline.name);
         assert_eq!(original_pipeline.config.name, cloned_pipeline.config.name);
-        assert_eq!(original_pipeline.config.stages.len(), cloned_pipeline.config.stages.len());
+        assert_eq!(
+            original_pipeline.config.stages.len(),
+            cloned_pipeline.config.stages.len()
+        );
         assert_eq!(original_pipeline.stages.len(), cloned_pipeline.stages.len());
 
         // Verify the cloned pipeline behaves identically
@@ -592,5 +648,166 @@ mod tests {
 
         let stage = StageFactory::create(&stage_def).unwrap();
         assert_eq!(stage.name(), "test-filter");
+    }
+
+    #[tokio::test]
+    async fn test_stage_factory_idempotent_receiver() {
+        let stage_def = StageDefinition {
+            name: "idemp-receiver".to_string(),
+            r#type: "idempotent_receiver".to_string(),
+            config: json!({
+                "key_field": "id",
+                "ttl_seconds": 3600,
+                "storage": "redis",
+                "redis_url": "redis://localhost:6379",
+                "fallback_on_error": "pass"
+            }),
+        };
+
+        let stage = StageFactory::create(&stage_def).unwrap();
+        assert_eq!(stage.name(), "idemp-receiver");
+    }
+
+    #[tokio::test]
+    async fn test_stage_error_creation() {
+        let err = StageError::new("TEST_CODE", "test message");
+        assert_eq!(err.code, "TEST_CODE");
+        assert_eq!(err.message, "test message");
+        assert!(!err.retryable);
+        assert_eq!(err.to_string(), "TEST_CODE: test message");
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_execute_with_error_stage() {
+        // Create a mock stage that returns an error
+        #[derive(Clone)]
+        struct ErrorStage;
+
+        #[async_trait]
+        impl Stage for ErrorStage {
+            async fn process(
+                &self,
+                _ctx: &StageContext,
+                _msg: Value,
+            ) -> Result<StageResult, ProcessingError> {
+                Ok(StageResult::Error(StageError::new(
+                    "TEST_ERROR",
+                    "stage error for testing",
+                )))
+            }
+
+            fn name(&self) -> &str {
+                "error-stage"
+            }
+        }
+
+        // Create a pipeline with the error stage
+        let config = PipelineConfig {
+            name: "test".to_string(),
+            topic: "test-topic".to_string(),
+            debezium_envelope: false,
+            staging_table: "test-table".to_string(),
+            dlq: None,
+            stages: vec![],
+            required_fields: vec![],
+            backpressure: BackpressureConfig {
+                channel_capacity: 100,
+            },
+            batching: Default::default(),
+        };
+
+        // Manually create a pipeline with our error stage
+        let mut pipeline = Pipeline::from_config(&config).unwrap();
+        pipeline.stages = vec![Box::new(ErrorStage)];
+
+        let ctx = create_test_context();
+        let msg = json!({"id": 123});
+
+        let result = pipeline.execute(&ctx, msg).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ProcessingError::Stage { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_execute_empty_messages_after_filter() {
+        // Create a filter that rejects everything
+        let filter_def = StageDefinition {
+            name: "filter".to_string(),
+            r#type: "filter".to_string(),
+            config: json!({
+                "mode": "include",
+                "conditions": [
+                    {
+                        "field": "status",
+                        "equals": "active"
+                    }
+                ],
+                "logic": "AND"
+            }),
+        };
+
+        let config = PipelineConfig {
+            name: "test".to_string(),
+            topic: "test-topic".to_string(),
+            debezium_envelope: false,
+            staging_table: "test-table".to_string(),
+            dlq: None,
+            stages: vec![filter_def],
+            required_fields: vec![],
+            backpressure: BackpressureConfig {
+                channel_capacity: 100,
+            },
+            batching: Default::default(),
+        };
+
+        let pipeline = Pipeline::from_config(&config).unwrap();
+
+        let ctx = create_test_context();
+        let msg = json!({"status": "inactive", "id": 123});
+
+        let results = pipeline.execute(&ctx, msg).await.unwrap();
+        // Filter should skip the message, resulting in empty output
+        assert_eq!(results.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_stage_default_lifecycle_methods() {
+        // Test default implementations of initialize, shutdown, health_check
+        #[derive(Clone)]
+        struct DefaultLifecycleStage;
+
+        #[async_trait]
+        impl Stage for DefaultLifecycleStage {
+            async fn process(
+                &self,
+                _ctx: &StageContext,
+                msg: Value,
+            ) -> Result<StageResult, ProcessingError> {
+                Ok(StageResult::Continue(msg))
+            }
+
+            fn name(&self) -> &str {
+                "default-lifecycle"
+            }
+            // Using default implementations for initialize, shutdown, health_check
+        }
+
+        let stage = DefaultLifecycleStage;
+
+        // All these should return Ok(())
+        assert!(stage.initialize().await.is_ok());
+        assert!(stage.shutdown().await.is_ok());
+        assert!(stage.health_check().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_message_metadata_creation() {
+        let metadata =
+            MessageMetadata::from_kafka("test-topic".to_string(), 3, 100, Some(1234567890));
+        assert_eq!(metadata.topic, "test-topic");
+        assert_eq!(metadata.partition, 3);
+        assert_eq!(metadata.offset, 100);
+        assert_eq!(metadata.timestamp, Some(1234567890));
+        assert!(metadata.headers.is_empty());
     }
 }

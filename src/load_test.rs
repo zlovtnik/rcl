@@ -1,6 +1,5 @@
 use crate::config::Config;
 use anyhow::Result;
-use chrono::Utc;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use std::time::{Duration, Instant};
 use tokio::time;
@@ -61,4 +60,91 @@ pub async fn run(cfg: Config, rate: u32, duration_sec: u64) -> Result<()> {
 
     println!("Load test complete. Sent {} messages.", count);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[tokio::test]
+    async fn test_run_rate_zero_errors() {
+        // Minimal config with placeholders - we won't reach producer creation because rate==0 check comes first
+        let cfg = Config {
+            service: crate::config::ServiceConfig {
+                log_level: crate::config::LogLevel::Info,
+                metrics_port: 9090,
+                otlp_endpoint: None,
+                health_check_timeout_ms: 5000,
+                shutdown_timeout: "30s".to_string(),
+            },
+            kafka: crate::config::KafkaConfig {
+                brokers: "localhost:9092".to_string(),
+                group_id: "g".to_string(),
+                security: None,
+                fetch: None,
+                session_timeout_ms: 30000,
+                max_inflight_messages: 1,
+                producer_retries: 1,
+                dlq_message_timeout_ms: 5000,
+                compression: "none".to_string(),
+                dlq_readiness_timeout_secs: 30,
+                dlq_readiness_backoff_secs: 1,
+                staleness_threshold_seconds: 60,
+            },
+            postgres: crate::config::PostgresConfig {
+                url: "postgres://user:pass@localhost/db".to_string(),
+                ssl_mode: None,
+                ssl_root_cert: None,
+                pool: None,
+                copy_enabled: false,
+                copy_batch_rows: 1000,
+                insert_batch_rows: 100,
+            },
+            pipelines: vec![],
+        };
+
+        let res = run(cfg, 0, 1).await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_run_no_pipelines_errors() {
+        let cfg = Config {
+            service: crate::config::ServiceConfig {
+                log_level: crate::config::LogLevel::Info,
+                metrics_port: 9090,
+                otlp_endpoint: None,
+                health_check_timeout_ms: 5000,
+                shutdown_timeout: "30s".to_string(),
+            },
+            kafka: crate::config::KafkaConfig {
+                brokers: "localhost:9092".to_string(),
+                group_id: "g".to_string(),
+                security: None,
+                fetch: None,
+                session_timeout_ms: 30000,
+                max_inflight_messages: 1,
+                producer_retries: 1,
+                dlq_message_timeout_ms: 5000,
+                compression: "none".to_string(),
+                dlq_readiness_timeout_secs: 30,
+                dlq_readiness_backoff_secs: 1,
+                staleness_threshold_seconds: 60,
+            },
+            postgres: crate::config::PostgresConfig {
+                url: "postgres://user:pass@localhost/db".to_string(),
+                ssl_mode: None,
+                ssl_root_cert: None,
+                pool: None,
+                copy_enabled: false,
+                copy_batch_rows: 1000,
+                insert_batch_rows: 100,
+            },
+            pipelines: vec![],
+        };
+
+        let res = run(cfg, 1000, 1).await;
+        assert!(res.is_err());
+    }
 }

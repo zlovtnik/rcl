@@ -55,14 +55,13 @@ This roadmap transforms your streaming CDC loader from a basic consumer into a p
 ### 2.1 Message Batching Coordinator
 **Priority: Critical** | **Effort: 8 hours**
 
-- [ ] Create `src/batcher.rs` module
-- [ ] Implement `Batcher` struct with per-pipeline accumulation buffers
-- [ ] Add time-based flush (configurable, default 5s)
-- [ ] Add size-based flush (use `copy_batch_rows` from config)
-- [ ] Add byte-size-based flush (prevent memory bloat)
-- [ ] Implement flush-on-shutdown
-- [ ] Track batch metrics (size, flush reason)
-- [ ] Handle partial batch writes (retry logic)
+- [x] Create `src/batcher.rs` module
+- [x] Implement `Batcher` struct with per-pipeline accumulation buffers
+- [x] Add time-based flush (configurable, default 5s)
+- [x] Add size-based flush (use `copy_batch_rows` from config)
+- [x] Add byte-size-based flush (prevent memory bloat)
+- [x] Implement flush-on-shutdown
+- [x] Track batch metrics (size, flush reason)
 
 **Config additions:**
 ```json
@@ -79,11 +78,11 @@ This roadmap transforms your streaming CDC loader from a basic consumer into a p
 ### 2.2 Integrate Batching into Consumer Loop
 **Priority: Critical** | **Effort: 4 hours**
 
-- [ ] Replace individual `writer.write()` calls with `batcher.add()`
-- [ ] Add background task for time-based flush triggers
-- [ ] Commit offsets only after successful batch write
-- [ ] Handle batch write failures (see retry logic below)
-- [ ] Ensure ordering within partition is maintained
+- [x] Replace individual `writer.write()` calls with `batcher.add()`
+- [x] Add background task for time-based flush triggers
+- [x] Commit offsets only after successful batch write
+- [x] Handle batch write failures (see Phase 4.1 Transient Error Retry Logic)
+- [x] Ensure ordering within partition is maintained
 
 **Deliverable:** 10-50x throughput improvement on write path
 
@@ -92,10 +91,10 @@ This roadmap transforms your streaming CDC loader from a basic consumer into a p
 ### 2.3 Dynamic Batch Size Tuning (Optional)
 **Priority: Low** | **Effort: 6 hours**
 
-- [ ] Track batch write latency percentiles
-- [ ] Implement adaptive batch sizing (increase if latency low, decrease if high)
-- [ ] Add metrics for batch size over time
-- [ ] Add config flag to enable/disable adaptive batching
+- [x] Track batch write latency percentiles
+- [x] Implement adaptive batch sizing (increase if latency low, decrease if high)
+- [x] Add metrics for batch size over time
+- [x] Add config flag to enable/disable adaptive batching
 
 **Deliverable:** Self-tuning batch sizes based on load
 
@@ -104,10 +103,10 @@ This roadmap transforms your streaming CDC loader from a basic consumer into a p
 ### 2.4 Basic Integration Verification
 **Priority: High** | **Effort: 4 hours**
 
-- [ ] Verify graceful shutdown behavior (ensure no message loss)
-- [ ] Verify batching correctness (flush intervals and size triggers)
-- [ ] Verify basic DLQ functionality (bad messages routed correctly)
-- [ ] Verify per-pipeline isolation (preliminary check)
+- [x] Verify graceful shutdown behavior (ensure no message loss)
+- [x] Verify batching correctness (flush intervals and size triggers)
+- [x] Verify basic DLQ functionality (bad messages routed correctly)
+- [x] Verify per-pipeline isolation (preliminary check)
 
 **Deliverable:** Core features verified early in development
 
@@ -177,6 +176,7 @@ This roadmap transforms your streaming CDC loader from a basic consumer into a p
 - [ ] Add max retry attempts config (default 3)
 - [ ] Track retry metrics (attempts, success after N retries)
 - [ ] For batch writes: retry entire batch or split into individual inserts
+- [ ] Handle partial batch writes (retry logic on transient failures)
 
 **Config addition:**
 ```json

@@ -69,3 +69,125 @@ impl ShutdownCoordinator {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_shutdown_coordinator_new() {
+        let (coordinator, _rx) = ShutdownCoordinator::new();
+        let mut subscriber = coordinator.subscribe();
+
+        // Initially there should be no message
+        assert!(matches!(
+            subscriber.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        // Sending a shutdown should be received by the subscriber
+        let _ = coordinator.notify_shutdown.send(());
+        assert!(matches!(subscriber.try_recv(), Ok(())));
+    }
+
+    #[test]
+    fn test_shutdown_coordinator_default() {
+        let coordinator = ShutdownCoordinator::default();
+        let mut subscriber = coordinator.subscribe();
+
+        // Initially there should be no message
+        assert!(matches!(
+            subscriber.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        // Sending a shutdown should be received by the subscriber
+        let _ = coordinator.notify_shutdown.send(());
+        assert!(matches!(subscriber.try_recv(), Ok(())));
+    }
+
+    #[test]
+    fn test_shutdown_coordinator_subscribe_multiple() {
+        let coordinator = ShutdownCoordinator::new().0;
+        let mut sub1 = coordinator.subscribe();
+        let mut sub2 = coordinator.subscribe();
+        let mut sub3 = coordinator.subscribe();
+
+        // Initially all subscribers should have no message
+        assert!(matches!(
+            sub1.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            sub2.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            sub3.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        // Send one shutdown and ensure all observers receive it
+        let _ = coordinator.notify_shutdown.send(());
+        assert!(matches!(sub1.try_recv(), Ok(())));
+        assert!(matches!(sub2.try_recv(), Ok(())));
+        assert!(matches!(sub3.try_recv(), Ok(())));
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_coordinator_broadcast() {
+        let (coordinator, mut rx) = ShutdownCoordinator::new();
+
+        // Clone for the spawn
+        let coordinator_clone = ShutdownCoordinator {
+            notify_shutdown: coordinator.notify_shutdown.clone(),
+        };
+
+        // Spawn a task that will send the shutdown signal
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let _ = coordinator_clone.notify_shutdown.send(());
+        });
+
+        // Wait for the signal
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+
+        let recv_val = result
+            .expect("should receive shutdown signal")
+            .expect("recv failed");
+        assert_eq!(recv_val, ());
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_coordinator_multiple_receivers() {
+        let (coordinator, mut rx1) = ShutdownCoordinator::new();
+        let mut rx2 = coordinator.subscribe();
+        let mut rx3 = coordinator.subscribe();
+
+        let coordinator_clone = ShutdownCoordinator {
+            notify_shutdown: coordinator.notify_shutdown.clone(),
+        };
+
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let _ = coordinator_clone.notify_shutdown.send(());
+        });
+
+        // All receivers should get the signal
+        let timeout = std::time::Duration::from_millis(100);
+
+        let r1 = tokio::time::timeout(timeout, rx1.recv()).await;
+        let r2 = tokio::time::timeout(timeout, rx2.recv()).await;
+        let r3 = tokio::time::timeout(timeout, rx3.recv()).await;
+
+        assert!(r1.is_ok());
+        assert!(r2.is_ok());
+        assert!(r3.is_ok());
+    }
+
+    #[test]
+    fn test_shutdown_broadcast_capacity() {
+        // Verify the broadcast capacity constant
+        assert_eq!(SHUTDOWN_BROADCAST_CAPACITY, 16);
+    }
+}

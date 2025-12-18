@@ -102,6 +102,7 @@ pub trait Stage: Send + Sync {
 - **TransformerStage**: Field mappings (rename, copy, extract nested), type conversions, defaults. Returns `Continue(modified)`.
 - **RouterStage**: Routes message to different table based on field value. Returns `Continue` with `_meta_table` injected.
 - **SplitterStage**: Explodes array fields into multiple messages. Returns `Split(Vec<Value>)`.
+- **IdempotentReceiverStage**: Deduplicates messages using Redis (default) or in-memory storage. Returns `Skip` for duplicates, `Continue` for new messages.
 
 **Stage Results:**
 - `StageResult::Continue(Value)` - Continue to next stage with modified message
@@ -114,6 +115,29 @@ pub trait Stage: Send + Sync {
 - Retryable errors may be retried within the pipeline
 - Non-retryable errors route to DLQ if configured
 - Always implement proper error handling in custom stages
+
+### Batching & Buffering (`src/batcher.rs`)
+Messages are buffered per pipeline/table combination and flushed based on:
+- **Time threshold**: `flush_interval_ms` (default: 5000ms)
+- **Message count**: `max_batch_size` (default: 5000 messages)
+- **Byte threshold**: `max_batch_bytes` (default: 10MB)
+- **Shutdown**: All buffers flushed during graceful shutdown
+
+**BatcherConfig fields:**
+- `flush_interval_ms` - Time-based flush interval (default: 5000ms)
+- `max_batch_size` - Message count per batch (default: 5000 messages)
+- `max_batch_bytes` - Cumulative byte limit per batch (default: 10MB)
+- `shutdown_timeout` - Timeout for graceful flush on shutdown (default: 30s)
+- `adaptive_batch_enabled` - Enable/disable adaptive batch sizing (default: false)
+- `adaptive_min_batch_size` - Minimum batch size in adaptive mode (default: 100)
+- `adaptive_max_batch_size` - Maximum batch size in adaptive mode (default: 50000)
+- `latency_window_size` - Number of recent latencies to track for moving average (default: 10)
+- `latency_target_ms` - Target write latency for adaptive sizing (default: 1000ms)
+
+**Adaptive Batching:**
+When `adaptive_batch_enabled` is true, batch sizes are automatically adjusted based on observed write latencies. The system tracks the last `latency_window_size` write operations and compares the moving average latency against `latency_target_ms`. If latency is below target, batch size gradually increases (up to `adaptive_max_batch_size`) to improve throughput; if latency exceeds target, batch size decreases (down to `adaptive_min_batch_size`) to reduce latency. This enables self-tuning under varying load without manual configuration. Disable by setting `adaptive_batch_enabled` to false to use fixed `max_batch_size` thresholds. Adaptive sizing respects all other flush triggers (time, byte limits).
+
+Batching enables efficient `COPY` bulk inserts. Failed batches are caught early; individual messages route to DLQ.
 
 ### Async/Concurrency Patterns
 - `tokio::spawn` for independent background tasks (fetch loop, heartbeat, graceful shutdown).
@@ -195,9 +219,14 @@ pub trait Stage: Send + Sync {
     - `max_retries` - Retry attempts before DLQ (default: 3)
     - `max_payload_bytes` - Max DLQ message size (default: 1MB)
   - `stages[]` - EIP pipeline stages
-    - `type` - Stage type (filter/transformer/router/splitter)
+    - `type` - Stage type (filter/transformer/router/splitter/idempotent_receiver)
     - `name` - Stage identifier
-    - `config` - Stage-specific configuration
+    - `config` - Stage-specific configuration (varies by type)
+      - **filter** stage: `field`, `operator` (equals/regex/contains/in), `value`, `mode` (include/exclude), `logic` (AND/OR for multiple conditions)
+      - **transformer** stage: `operations` (array of rename/copy/extract/convert/default operations), `fields` (field config)
+      - **router** stage: `field` (routing key), `routes` (table name mappings)
+      - **splitter** stage: `field` (array field to explode)
+      - **idempotent_receiver** stage: `key_field` (field for deduplication key), `ttl_seconds` (cache TTL), `storage` (redis or in-memory), `redis_url` (if storage=redis), `fallback_on_error` (pass or fail)
 
 **Configuration Validation:**
 - Table names validated against SQL injection patterns

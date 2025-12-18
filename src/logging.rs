@@ -2,6 +2,8 @@ use crate::config::ServiceConfig;
 use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
+#[cfg(test)]
+use serial_test::serial;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Registry};
 
 pub struct TracingGuard {
@@ -50,4 +52,27 @@ pub fn init(
     Ok(TracingGuard {
         _has_otlp: has_otlp,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::LogLevel;
+    use crate::config::ServiceConfig;
+
+    #[serial]
+    #[test]
+    fn test_init_no_otlp() {
+        let cfg = ServiceConfig {
+            log_level: LogLevel::Info,
+            metrics_port: 9000,
+            otlp_endpoint: None,
+            health_check_timeout_ms: 5000,
+            shutdown_timeout: "30s".to_string(),
+        };
+
+        let guard = init(&cfg).expect("init should succeed");
+        // No OTLP endpoint configured
+        assert!(!guard._has_otlp);
+    }
 }

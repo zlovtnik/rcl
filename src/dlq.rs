@@ -350,3 +350,194 @@ pub async fn inspect(cfg: &KafkaConfig, topic: &str, limit: usize) -> Result<()>
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::MessageContext;
+
+    #[test]
+    fn test_truncate_utf8_empty_and_zero() {
+        assert_eq!(truncate_utf8("", 10), "");
+        assert_eq!(truncate_utf8("hello", 0), "");
+    }
+
+    #[test]
+    fn test_truncate_utf8_multibyte() {
+        // 'é' is two bytes in UTF-8; ensure we don't cut in the middle
+        let s = "aébc"; // bytes: a (1) é (2) b (1) c (1)
+                        // limit 2 bytes should only include 'a'
+        assert_eq!(truncate_utf8(s, 2), "a");
+        // limit 3 bytes should include 'a' and 'é'
+        assert_eq!(truncate_utf8(s, 3), "aé");
+    }
+
+    #[test]
+    fn test_sanitize_payload_small() {
+        let raw = "small payload";
+        let (payload, truncated) = sanitize_payload(raw, raw.len(), 100);
+        assert!(!truncated);
+        assert!(matches!(payload, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_sanitize_payload_large() {
+        let raw = "x".repeat(10_000);
+        let (payload, truncated) = sanitize_payload(&raw, raw.len(), 1024);
+        assert!(truncated);
+        let s = payload.into_owned();
+        assert!(s.contains("<payload omitted - too large>"));
+    }
+
+    #[test]
+    fn test_dlq_payload_serialize() {
+        let ctx = MessageContext::new("topic-a".to_string(), 1, 2, 3);
+        let reason = crate::errors::ProcessingError::Validation(
+            crate::errors::ValidationError::new("bad".to_string()),
+        );
+        let raw = "ok";
+        let dlq_cfg = crate::eip::DlqConfig {
+            topic: "dlq".to_string(),
+            max_payload_bytes: 1024,
+            max_retries: 3,
+        };
+
+        let (payload, truncated) = sanitize_payload(raw, raw.len(), dlq_cfg.max_payload_bytes);
+        let body = serde_json::to_string(&DlqPayload {
+            context: &ctx,
+            reason: reason.public_reason(),
+            pipeline: "p1",
+            payload,
+            original_size: raw.len(),
+            truncated,
+        })
+        .unwrap();
+
+        // Should be valid JSON and contain expected fields
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v.get("pipeline").and_then(|p| p.as_str()), Some("p1"));
+        assert_eq!(v.get("payload").and_then(|p| p.as_str()), Some("ok"));
+    }
+
+    #[test]
+    fn test_truncate_utf8_emoji_and_boundaries() {
+        // emoji are 4 bytes; ensure truncation doesn't cut them
+        let s = "a🙂b"; // a (1) 🙂 (4) b (1)
+                        // limit 2 bytes -> only 'a'
+        assert_eq!(truncate_utf8(s, 2), "a");
+        // limit 5 bytes -> include emoji
+        assert_eq!(truncate_utf8(s, 5), "a🙂");
+    }
+
+    #[test]
+    fn test_sanitize_payload_zero_max() {
+        let raw = "non empty";
+        let (payload, truncated) = sanitize_payload(raw, raw.len(), 0);
+        // with max 0 we should get an owned truncated placeholder
+        assert!(truncated);
+        let s = payload.into_owned();
+        assert!(s.contains("payload omitted"));
+    }
+
+    #[test]
+    fn test_sanitize_payload_within_limit() {
+        let raw = "test payload";
+        let original_size = raw.len();
+        let (payload, truncated) = sanitize_payload(raw, original_size, 1000);
+
+        assert!(!truncated);
+        assert_eq!(payload.as_ref(), raw);
+    }
+
+    #[test]
+    fn test_sanitize_payload_exceeds_limit() {
+        let raw = "this is a very long payload that exceeds the max size";
+        let original_size = raw.len();
+        let max = 20;
+
+        let (payload, truncated) = sanitize_payload(raw, original_size, max);
+        assert!(truncated);
+        let s = payload.into_owned();
+        assert!(s.contains("payload omitted"));
+    }
+
+    #[test]
+    fn test_truncate_utf8_empty() {
+        assert_eq!(truncate_utf8("", 100), "");
+    }
+
+    #[test]
+    fn test_truncate_utf8_zero_max() {
+        assert_eq!(truncate_utf8("hello", 0), "");
+    }
+
+    #[test]
+    fn test_truncate_utf8_exact_fit() {
+        let s = "hello";
+        assert_eq!(truncate_utf8(s, 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_utf8_mid_char() {
+        // Even with enough bytes for one multi-byte char, it truncates properly
+        let s = "a🙂";
+        assert_eq!(truncate_utf8(s, 2), "a"); // 2 bytes -> can't fit emoji (4 bytes)
+    }
+
+    #[test]
+    fn test_dlq_payload_serialization() {
+        let ctx = MessageContext::new("topic".to_string(), 0, 42, 123);
+        let reason = crate::errors::PublicErrorReason {
+            code: "ERR001".to_string(),
+            message: "test error".to_string(),
+        };
+
+        let payload_str = DlqPayload {
+            context: &ctx,
+            reason,
+            pipeline: "p1",
+            payload: std::borrow::Cow::Borrowed("test"),
+            original_size: 4,
+            truncated: false,
+        };
+
+        let json = serde_json::to_string(&payload_str).unwrap();
+        assert!(json.contains("topic"));
+        assert!(json.contains("ERR001"));
+        assert!(json.contains("test"));
+    }
+
+    #[test]
+    fn test_dlq_payload_truncated_flag() {
+        let ctx = MessageContext::new("topic".to_string(), 0, 42, 123);
+        let reason = crate::errors::PublicErrorReason {
+            code: "ERR001".to_string(),
+            message: "test error".to_string(),
+        };
+
+        let payload_str = DlqPayload {
+            context: &ctx,
+            reason,
+            pipeline: "p1",
+            payload: std::borrow::Cow::Borrowed("test"),
+            original_size: 1000,
+            truncated: true,
+        };
+
+        let json = serde_json::to_string(&payload_str).unwrap();
+        assert!(json.contains("\"truncated\":true"));
+    }
+
+    #[test]
+    fn test_max_dlq_preview_bytes_constant() {
+        assert_eq!(MAX_DLQ_PREVIEW_BYTES, 4_096);
+    }
+
+    #[test]
+    fn test_truncate_utf8_multibyte_chars() {
+        // Test with various multibyte characters
+        let s = "a€b"; // € is 3 bytes
+        assert_eq!(truncate_utf8(s, 2), "a");
+        assert_eq!(truncate_utf8(s, 4), "a€");
+    }
+}

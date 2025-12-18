@@ -6,6 +6,7 @@ mod dlq;
 mod eip;
 mod errors;
 mod health;
+mod integration_tests;
 mod load_test;
 mod logging;
 mod metrics;
@@ -108,7 +109,8 @@ async fn main() -> Result<()> {
             let health = Arc::new(HealthRegistry::new(std::time::Duration::from_millis(
                 cfg.service.health_check_timeout_ms,
             )));
-            let writer = Arc::new(Writer::new(writer_cfg, metrics.clone(), health).await?);
+            let writer: Arc<Writer> =
+                Arc::new(Writer::new(writer_cfg, metrics.clone(), health).await?);
 
             consumer::replay(
                 cfg,
@@ -142,7 +144,8 @@ async fn run_service(cfg: Config) -> Result<()> {
     let cfg = Arc::new(cfg);
     let shutdown_timeout = cfg.service.shutdown_timeout_duration();
     let writer_cfg = Arc::new(cfg.postgres.clone());
-    let writer = Arc::new(Writer::new(writer_cfg, metrics.clone(), health.clone()).await?);
+    let writer: Arc<Writer> =
+        Arc::new(Writer::new(writer_cfg, metrics.clone(), health.clone()).await?);
 
     let (coordinator, shutdown_rx) = shutdown::ShutdownCoordinator::new();
 

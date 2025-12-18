@@ -130,13 +130,11 @@ impl HealthRegistry {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
+        // Initialize status with Healthy, then update based on kafka and postgres immediately
         let mut status = ComponentStatus::Healthy;
-        let mut all_statuses = vec![kafka.clone(), postgres.clone()];
-
-        // First pass: check for Unhealthy
-        if all_statuses.iter().any(|s| s == &ComponentStatus::Unhealthy) {
+        if kafka == ComponentStatus::Unhealthy || postgres == ComponentStatus::Unhealthy {
             status = ComponentStatus::Unhealthy;
-        } else if all_statuses.iter().any(|s| s == &ComponentStatus::Degraded) {
+        } else if kafka == ComponentStatus::Degraded || postgres == ComponentStatus::Degraded {
             status = ComponentStatus::Degraded;
         }
 
@@ -144,6 +142,7 @@ impl HealthRegistry {
         let timeout = chrono::Duration::from_std(self.timeout).unwrap_or(chrono::Duration::MAX);
         let now = Utc::now();
 
+        // Single pass: compute pipeline health, insert into map, and update overall status inline
         for (name, p) in pipelines_guard.iter() {
             let mut p_health = p.clone();
             let last_activity = p_health.last_processed_at.unwrap_or(p_health.registered_at);
@@ -155,15 +154,16 @@ impl HealthRegistry {
                 p_health.last_error = Some("Pipeline stalled".to_string());
             }
 
-            all_statuses.push(p_health.status.clone());
-            pipelines.insert(name.clone(), p_health);
-        }
+            // Update overall status inline: Unhealthy immediately, Degraded only if not already Unhealthy
+            if p_health.status == ComponentStatus::Unhealthy {
+                status = ComponentStatus::Unhealthy;
+            } else if p_health.status == ComponentStatus::Degraded
+                && status != ComponentStatus::Unhealthy
+            {
+                status = ComponentStatus::Degraded;
+            }
 
-        // Second pass: update status based on worst case including pipelines
-        if all_statuses.iter().any(|s| s == &ComponentStatus::Unhealthy) {
-            status = ComponentStatus::Unhealthy;
-        } else if all_statuses.iter().any(|s| s == &ComponentStatus::Degraded) {
-            status = ComponentStatus::Degraded;
+            pipelines.insert(name.clone(), p_health);
         }
 
         SystemHealth {
@@ -172,5 +172,56 @@ impl HealthRegistry {
             postgres,
             pipelines,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_register_and_update_pipeline() {
+        let reg = HealthRegistry::new(std::time::Duration::from_secs(60));
+        reg.register_pipeline("p1");
+
+        // update success should work
+        assert!(reg.update_pipeline_success("p1").is_ok());
+
+        // update error increments count
+        assert!(reg.update_pipeline_error("p1", "err".to_string()).is_ok());
+
+        let status = reg.get_status();
+        assert!(status.pipelines.contains_key("p1"));
+        let p = status.pipelines.get("p1").unwrap();
+        assert_eq!(p.error_count, 1);
+        assert_eq!(p.status, ComponentStatus::Degraded);
+    }
+
+    #[test]
+    fn test_set_component_status_changes_overall() {
+        let reg = HealthRegistry::new(std::time::Duration::from_secs(60));
+        reg.register_pipeline("p2");
+        assert!(reg.set_kafka_status(ComponentStatus::Unhealthy).is_ok());
+        let s = reg.get_status();
+        assert_eq!(s.kafka, ComponentStatus::Unhealthy);
+        assert_eq!(s.status, ComponentStatus::Unhealthy);
+    }
+
+    #[test]
+    fn test_pipeline_stall_becomes_degraded() {
+        // zero timeout causes immediate stall detection
+        let reg = HealthRegistry::new(std::time::Duration::from_secs(0));
+        reg.register_pipeline("p3");
+        let s = reg.get_status();
+        // pipeline should be degraded due to zero timeout
+        let p = s.pipelines.get("p3").unwrap();
+        assert_eq!(p.status, ComponentStatus::Degraded);
+        assert_eq!(s.status, ComponentStatus::Degraded);
+    }
+
+    #[test]
+    fn test_update_unregistered_pipeline_returns_error() {
+        let reg = HealthRegistry::new(std::time::Duration::from_secs(60));
+        assert!(reg.update_pipeline_success("nope").is_err());
     }
 }

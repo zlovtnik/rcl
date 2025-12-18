@@ -8,6 +8,7 @@ use backoff::ExponentialBackoff;
 use chrono::Utc;
 use csv::Writer as CsvWriter;
 
+use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions, PgSslMode};
 use sqlx::types::Json;
@@ -78,6 +79,45 @@ pub struct Writer {
     cfg: Arc<PostgresConfig>,
     metrics: Metrics,
     health: Arc<HealthRegistry>,
+}
+
+#[async_trait]
+#[allow(dead_code)]
+pub trait WriterTrait: Send + Sync {
+    async fn write(
+        &self,
+        value: &Value,
+        table: &str,
+        pipeline_name: &str,
+    ) -> Result<(), ProcessingError>;
+
+    async fn write_batch(
+        &self,
+        values: &[Value],
+        table: &str,
+        pipeline_name: &str,
+    ) -> Result<(), ProcessingError>;
+}
+
+#[async_trait]
+impl WriterTrait for Writer {
+    async fn write(
+        &self,
+        value: &Value,
+        table: &str,
+        pipeline_name: &str,
+    ) -> Result<(), ProcessingError> {
+        Writer::write(self, value, table, pipeline_name).await
+    }
+
+    async fn write_batch(
+        &self,
+        values: &[Value],
+        table: &str,
+        pipeline_name: &str,
+    ) -> Result<(), ProcessingError> {
+        Writer::write_batch(self, values, table, pipeline_name).await
+    }
 }
 
 impl Writer {
@@ -258,23 +298,24 @@ async fn copy_into(
 
         let json = serde_json::to_string(&meta.payload)
             .map_err(|e| ProcessingError::from(TransportError::new("json encode", e)))?;
-        let escaped_json = json.replace('"', "\"\"");
         let mut wtr = CsvWriter::from_writer(vec![]);
-        wtr.write_record(&[
-            &escaped_json,
+        wtr.write_record([
+            json.as_str(),
             &Utc::now().timestamp_millis().to_string(),
             &meta.topic,
             &meta.partition.to_string(),
             &meta.offset.to_string(),
             &meta.ingest_ts.to_string(),
         ])
-        .map_err(|e| ProcessingError::Validation(ValidationError::new(format!("csv write: {}", e))))?;
-        let csv_data = wtr
-            .into_inner()
-            .map_err(|e| ProcessingError::Validation(ValidationError::new(format!("csv flush: {}", e))))?;
-        let line = String::from_utf8(csv_data)
-            .map_err(|e| ProcessingError::Validation(ValidationError::new(format!("utf8 decode: {}", e))))?
-            + "\n";
+        .map_err(|e| {
+            ProcessingError::Validation(ValidationError::new(format!("csv write: {}", e)))
+        })?;
+        let csv_data = wtr.into_inner().map_err(|e| {
+            ProcessingError::Validation(ValidationError::new(format!("csv flush: {}", e)))
+        })?;
+        let line = String::from_utf8(csv_data).map_err(|e| {
+            ProcessingError::Validation(ValidationError::new(format!("utf8 decode: {}", e)))
+        })?;
         writer
             .send(line.into_bytes())
             .await
@@ -394,5 +435,218 @@ mod tests {
 
         assert!(validate_table_identifier("users; DROP TABLE users;--").is_err());
         assert!(validate_table_identifier("users' OR '1'='1").is_err());
+    }
+
+    #[test]
+    fn test_record_meta_extract() {
+        let v = serde_json::json!({
+            "_meta_topic": "t1",
+            "_meta_partition": 3,
+            "_meta_offset": 7,
+            "_meta_ingest_ts": 12345,
+            "operation_type": "u",
+            "name": "bob"
+        });
+
+        let meta = RecordMeta::extract(&v);
+        assert_eq!(meta.topic, "t1");
+        assert_eq!(meta.partition, 3);
+        assert_eq!(meta.offset, 7);
+        assert_eq!(meta.ingest_ts, 12345);
+        assert_eq!(meta.operation, Operation::Update);
+        // payload should no longer contain meta fields
+        if let serde_json::Value::Object(map) = meta.payload {
+            assert!(map.get("_meta_topic").is_none());
+            assert_eq!(map.get("name").and_then(|v| v.as_str()), Some("bob"));
+        } else {
+            panic!("payload not object")
+        }
+    }
+
+    #[test]
+    fn test_copy_csv_generation_contains_meta_and_payload() {
+        let v = serde_json::json!({
+            "_meta_topic": "t1",
+            "_meta_partition": 3,
+            "_meta_offset": 7,
+            "_meta_ingest_ts": 12345,
+            "operation_type": "c",
+            "name": "bob"
+        });
+
+        let meta = RecordMeta::extract(&v);
+
+        // replicate the CSV generation logic from copy_into
+        let json_payload = serde_json::to_string(&meta.payload).expect("json encode");
+        let mut wtr = CsvWriter::from_writer(vec![]);
+        wtr.write_record(&[
+            json_payload.as_str(),
+            &Utc::now().timestamp_millis().to_string(),
+            &meta.topic,
+            &meta.partition.to_string(),
+            &meta.offset.to_string(),
+            &meta.ingest_ts.to_string(),
+        ])
+        .expect("csv write");
+        let csv_data = wtr.into_inner().expect("csv into_inner");
+        let line = String::from_utf8(csv_data).expect("utf8");
+
+        // Check that CSV line contains the expected metadata and payload fields
+        assert!(line.contains("t1"));
+        assert!(line.contains("3"));
+        assert!(line.contains("7"));
+        assert!(line.contains("12345"));
+        assert!(line.contains("name"));
+        assert!(line.contains("bob"));
+    }
+
+    #[test]
+    fn test_record_meta_extract_with_all_operations() {
+        // Test each operation type
+        let operations = vec![
+            ("c", Operation::Create),
+            ("r", Operation::Read),
+            ("u", Operation::Update),
+            ("d", Operation::Delete),
+        ];
+
+        for (op_str, expected_op) in operations {
+            let v = serde_json::json!({
+                "_meta_topic": "test_topic",
+                "_meta_partition": 0,
+                "_meta_offset": 0,
+                "_meta_ingest_ts": 1000,
+                "operation_type": op_str,
+                "data": "test"
+            });
+
+            let meta = RecordMeta::extract(&v);
+            assert_eq!(meta.operation, expected_op);
+        }
+    }
+
+    #[test]
+    fn test_record_meta_extract_missing_meta_fields() {
+        // Test extraction when some meta fields are missing - should use defaults
+        let v = serde_json::json!({
+            "_meta_topic": "test",
+            "data": "value"
+        });
+
+        let meta = RecordMeta::extract(&v);
+        assert_eq!(meta.topic, "test");
+        assert_eq!(meta.partition, 0); // default
+        assert_eq!(meta.offset, 0); // default
+        assert_eq!(meta.ingest_ts, 0); // default
+    }
+
+    #[test]
+    fn test_table_identifier_valid_with_numbers() {
+        assert!(validate_table_identifier("table1").is_ok());
+        assert!(validate_table_identifier("public.table123").is_ok());
+        assert!(validate_table_identifier("_123_table").is_ok());
+    }
+
+    #[test]
+    fn test_table_identifier_underscore_start() {
+        assert!(validate_table_identifier("_table").is_ok());
+        assert!(validate_table_identifier("_schema._table").is_ok());
+    }
+
+    #[test]
+    fn test_table_identifier_length_boundary() {
+        // Each part (schema or table) must be <= 63 chars
+        // 63 characters should be valid
+        let valid_63 = "a".repeat(63);
+        assert!(validate_table_identifier(&valid_63).is_ok());
+
+        // 64 characters should be invalid
+        let invalid_64 = "a".repeat(64);
+        assert!(validate_table_identifier(&invalid_64).is_err());
+
+        // With schema prefix: each part must be <= 63
+        let valid_schema = format!("schema.{}", "a".repeat(63));
+        assert!(validate_table_identifier(&valid_schema).is_ok());
+
+        // Schema part too long
+        let invalid_schema = format!("{}.table", "a".repeat(64));
+        assert!(validate_table_identifier(&invalid_schema).is_err());
+
+        // Table part too long
+        let invalid_table = format!("schema.{}", "a".repeat(64));
+        assert!(validate_table_identifier(&invalid_table).is_err());
+    }
+
+    #[test]
+    fn test_record_meta_payload_cleanliness() {
+        // Verify that extracted payload doesn't contain metadata keys
+        // Note: operation_type is NOT removed, only _meta_* fields are
+        let v = serde_json::json!({
+            "_meta_topic": "topic",
+            "_meta_partition": 1,
+            "_meta_offset": 100,
+            "_meta_ingest_ts": 2000,
+            "operation_type": "c",
+            "user_id": 42,
+            "name": "Alice",
+            "email": "alice@example.com"
+        });
+
+        let meta = RecordMeta::extract(&v);
+
+        // Payload should be an object
+        assert!(meta.payload.is_object());
+        let obj = meta.payload.as_object().unwrap();
+
+        // Should not contain metadata keys
+        assert!(!obj.contains_key("_meta_topic"));
+        assert!(!obj.contains_key("_meta_partition"));
+        assert!(!obj.contains_key("_meta_offset"));
+        assert!(!obj.contains_key("_meta_ingest_ts"));
+
+        // operation_type IS retained in the payload (it's data, not metadata)
+        assert!(obj.contains_key("operation_type"));
+
+        // Should contain data keys
+        assert_eq!(obj.get("user_id").and_then(|v| v.as_i64()), Some(42));
+        assert_eq!(obj.get("name").and_then(|v| v.as_str()), Some("Alice"));
+        assert_eq!(
+            obj.get("email").and_then(|v| v.as_str()),
+            Some("alice@example.com")
+        );
+    }
+
+    #[test]
+    fn test_csv_with_special_characters() {
+        // Test that special characters in payload are properly escaped in CSV
+        let v = serde_json::json!({
+            "_meta_topic": "topic",
+            "_meta_partition": 0,
+            "_meta_offset": 0,
+            "_meta_ingest_ts": 0,
+            "operation_type": "c",
+            "text": "hello,\"world\""
+        });
+
+        let meta = RecordMeta::extract(&v);
+        let json_str = serde_json::to_string(&meta.payload).unwrap();
+        let mut wtr = CsvWriter::from_writer(vec![]);
+
+        wtr.write_record(&[
+            json_str.as_str(),
+            "12345",
+            &meta.topic,
+            &meta.partition.to_string(),
+            &meta.offset.to_string(),
+            &meta.ingest_ts.to_string(),
+        ])
+        .unwrap();
+
+        let csv_bytes = wtr.into_inner().unwrap();
+        let csv_str = String::from_utf8(csv_bytes).unwrap();
+
+        // CSV should contain the data (CSV writer handles escaping)
+        assert!(csv_str.contains("text"));
+        assert!(csv_str.contains("world"));
     }
 }

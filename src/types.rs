@@ -74,3 +74,31 @@ impl MessageContext {
         format!("{}:{}:{}", self.topic, self.partition, self.offset)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_operation_try_from_and_display() {
+        assert_eq!(Operation::try_from("c").unwrap(), Operation::Create);
+        assert_eq!(Operation::try_from("r").unwrap(), Operation::Read);
+        assert_eq!(Operation::try_from("u").unwrap(), Operation::Update);
+        assert_eq!(Operation::try_from("d").unwrap(), Operation::Delete);
+
+        let op = Operation::Create;
+        assert_eq!(op.to_string(), "c");
+    }
+
+    #[test]
+    fn test_operation_try_from_invalid() {
+        let err = Operation::try_from("x").unwrap_err();
+        assert_eq!(err.input, "x");
+    }
+
+    #[test]
+    fn test_message_context_correlation_id() {
+        let ctx = MessageContext::new("topic".to_string(), 1, 42, 0);
+        assert_eq!(ctx.correlation_id(), "topic:1:42");
+    }
+}

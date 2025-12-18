@@ -27,6 +27,81 @@ pub enum ProcessingError {
     /// Raised when a pipeline stage fails.
     #[error("stage error: {0}")]
     Stage(crate::eip::StageError),
+    /// Raised when batch write partially fails - some messages succeeded, some failed.
+    #[error("batch partial failure: {0}")]
+    BatchPartialFailure(#[from] BatchPartialFailure),
+}
+
+/// Non-recursive error type for individual messages. This is identical to ProcessingError
+/// but excludes BatchPartialFailure to prevent unbounded recursion in batch error handling.
+///
+/// This type should be used when handling errors for individual messages within batch operations.
+/// Use MessageError instead of ProcessingError in contexts where you want to guarantee that
+/// batch partial failures cannot create recursive error structures.
+///
+/// Conversion traits are provided to convert between MessageError and ProcessingError:
+/// - `MessageError` can always be converted to `ProcessingError` via `From`/`Into`
+/// - `ProcessingError` can be converted to `MessageError` via `TryFrom`, but will fail
+///   for `BatchPartialFailure` variants to maintain the non-recursion guarantee
+#[derive(Debug, Error)]
+pub enum MessageError {
+    /// Raised when a message is missing the expected payload bytes.
+    #[allow(dead_code)]
+    #[error("missing payload")]
+    MissingPayload,
+    /// Raised when payload bytes cannot be converted to UTF-8.
+    #[error("invalid utf8: {0}")]
+    InvalidUtf8(#[from] std::str::Utf8Error),
+    /// Raised when JSON parsing fails while decoding the payload.
+    #[error("json decode error: {0}")]
+    JsonDecode(#[from] JsonError),
+    /// Raised when the Debezium envelope is malformed or incomplete.
+    #[error("debezium unwrap failed: {0}")]
+    Debezium(#[from] DebeziumError),
+    /// Raised when a message violates pipeline validation rules.
+    #[error("validation failed: {0}")]
+    Validation(#[from] ValidationError),
+    /// Raised when downstream transport or storage calls fail.
+    #[error("transport: {0}")]
+    Transport(#[from] TransportError),
+    /// Raised when a pipeline stage fails.
+    #[error("stage error: {0}")]
+    Stage(crate::eip::StageError),
+}
+
+// Conversion traits between ProcessingError and MessageError
+impl From<MessageError> for ProcessingError {
+    fn from(err: MessageError) -> Self {
+        match err {
+            MessageError::MissingPayload => ProcessingError::MissingPayload,
+            MessageError::InvalidUtf8(e) => ProcessingError::InvalidUtf8(e),
+            MessageError::JsonDecode(e) => ProcessingError::JsonDecode(e),
+            MessageError::Debezium(e) => ProcessingError::Debezium(e),
+            MessageError::Validation(e) => ProcessingError::Validation(e),
+            MessageError::Transport(e) => ProcessingError::Transport(e),
+            MessageError::Stage(e) => ProcessingError::Stage(e),
+        }
+    }
+}
+
+impl TryFrom<ProcessingError> for MessageError {
+    type Error = ProcessingError;
+
+    fn try_from(err: ProcessingError) -> Result<Self, Self::Error> {
+        match err {
+            ProcessingError::MissingPayload => Ok(MessageError::MissingPayload),
+            ProcessingError::InvalidUtf8(e) => Ok(MessageError::InvalidUtf8(e)),
+            ProcessingError::JsonDecode(e) => Ok(MessageError::JsonDecode(e)),
+            ProcessingError::Debezium(e) => Ok(MessageError::Debezium(e)),
+            ProcessingError::Validation(e) => Ok(MessageError::Validation(e)),
+            ProcessingError::Transport(e) => Ok(MessageError::Transport(e)),
+            ProcessingError::Stage(e) => Ok(MessageError::Stage(e)),
+            ProcessingError::BatchPartialFailure(_) => {
+                // Cannot convert BatchPartialFailure to MessageError as it would break non-recursion guarantee
+                Err(err)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -53,6 +128,29 @@ impl ValidationError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("batch partial failure: {failed_count} of {total_count} messages failed")]
+pub struct BatchPartialFailure {
+    pub failed_count: usize,
+    pub total_count: usize,
+    pub failed_messages: Vec<(serde_json::Value, MessageError)>,
+}
+
+impl BatchPartialFailure {
+    #[allow(dead_code)]
+    pub fn new(
+        total_count: usize,
+        failed_messages: Vec<(serde_json::Value, MessageError)>,
+    ) -> Self {
+        let failed_count = failed_messages.len();
+        Self {
+            failed_count,
+            total_count,
+            failed_messages,
         }
     }
 }
@@ -172,6 +270,13 @@ impl ProcessingError {
                 code: e.code.clone(),
                 message: e.message.clone(),
             },
+            ProcessingError::BatchPartialFailure(e) => PublicErrorReason {
+                code: "batch_partial_failure".to_string(),
+                message: format!(
+                    "{} of {} messages failed in batch",
+                    e.failed_count, e.total_count
+                ),
+            },
         }
     }
 
@@ -179,6 +284,7 @@ impl ProcessingError {
         match self {
             ProcessingError::Transport(e) => e.is_retryable(),
             ProcessingError::Stage(e) => e.retryable,
+            ProcessingError::BatchPartialFailure(_) => false, // Partial failures are not retryable as a whole
             _ => false,
         }
     }
@@ -471,5 +577,179 @@ mod tests {
         // Note: These codes are stable across PostgreSQL versions and are
         // suitable for production deployments targeting PostgreSQL 12+.
         assert!(true, "PostgreSQL error codes are current and stable");
+    }
+
+    // Tests for MessageError and conversion traits
+    #[test]
+    fn test_processing_error_to_message_error_conversion_batch_failure_fails() {
+        // Test that BatchPartialFailure cannot be converted to MessageError
+        let batch_failure = BatchPartialFailure::new(5, vec![]);
+        let proc_err = ProcessingError::BatchPartialFailure(batch_failure);
+        let result = MessageError::try_from(proc_err);
+        assert!(
+            result.is_err(),
+            "BatchPartialFailure should not convert to MessageError"
+        );
+
+        // Verify the error returned is the original BatchPartialFailure
+        let err = result.unwrap_err();
+        assert!(matches!(err, ProcessingError::BatchPartialFailure(_)));
+    }
+
+    #[test]
+    fn test_message_error_to_processing_error_conversion() {
+        // Test MessageError -> ProcessingError conversion
+        let msg_err = MessageError::Validation(ValidationError::new("test validation"));
+        let proc_err: ProcessingError = msg_err.into();
+        assert!(matches!(proc_err, ProcessingError::Validation(_)));
+
+        // Test all variants convert properly
+        let test_cases = vec![
+            MessageError::MissingPayload,
+            MessageError::JsonDecode(
+                serde_json::from_str::<serde_json::Value>("invalid").unwrap_err(),
+            ),
+            MessageError::Debezium(DebeziumError::new("test")),
+            MessageError::Validation(ValidationError::new("test")),
+            MessageError::Transport(TransportError::new("test", sqlx::Error::RowNotFound)),
+            MessageError::Stage(crate::eip::StageError {
+                code: "test".to_string(),
+                message: "test".to_string(),
+                retryable: false,
+            }),
+        ];
+
+        for msg_err in test_cases {
+            let proc_err: ProcessingError = msg_err.into();
+            // Ensure the conversion doesn't panic and produces a ProcessingError
+            assert!(matches!(
+                proc_err,
+                ProcessingError::MissingPayload
+                    | ProcessingError::JsonDecode(_)
+                    | ProcessingError::Debezium(_)
+                    | ProcessingError::Validation(_)
+                    | ProcessingError::Transport(_)
+                    | ProcessingError::Stage(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_processing_error_to_message_error_conversion_success() {
+        // Test ProcessingError -> MessageError conversion for non-BatchPartialFailure variants
+        let proc_err = ProcessingError::Validation(ValidationError::new("test validation"));
+        let msg_err = MessageError::try_from(proc_err).unwrap();
+        assert!(matches!(msg_err, MessageError::Validation(_)));
+
+        // Test all non-BatchPartialFailure variants convert successfully
+        let test_cases = vec![
+            ProcessingError::MissingPayload,
+            ProcessingError::JsonDecode(
+                serde_json::from_str::<serde_json::Value>("invalid").unwrap_err(),
+            ),
+            ProcessingError::Debezium(DebeziumError::new("test")),
+            ProcessingError::Validation(ValidationError::new("test")),
+            ProcessingError::Transport(TransportError::new("test", sqlx::Error::RowNotFound)),
+            ProcessingError::Stage(crate::eip::StageError {
+                code: "test".to_string(),
+                message: "test".to_string(),
+                retryable: false,
+            }),
+        ];
+
+        for proc_err in test_cases {
+            let result = MessageError::try_from(proc_err);
+            assert!(
+                result.is_ok(),
+                "Expected successful conversion, but got error"
+            );
+        }
+    }
+
+    #[test]
+    fn test_message_error_variants() {
+        // Test that MessageError has all the expected variants
+        let _missing_payload = MessageError::MissingPayload;
+        // Create a valid Utf8Error by attempting to convert invalid UTF-8 bytes
+        let invalid_utf8_bytes = &[0xff, 0xfe];
+        let _invalid_utf8 =
+            MessageError::InvalidUtf8(std::str::from_utf8(invalid_utf8_bytes).unwrap_err());
+        let _json_decode = MessageError::JsonDecode(
+            serde_json::from_str::<serde_json::Value>("invalid").unwrap_err(),
+        );
+        let _debezium = MessageError::Debezium(DebeziumError::new("test"));
+        let _validation = MessageError::Validation(ValidationError::new("test"));
+        // Use SqlxError for transport test since TransportSource implements From<SqlxError>
+        let sqlx_err = sqlx::Error::RowNotFound;
+        let _transport = MessageError::Transport(TransportError::new("test", sqlx_err));
+        let _stage = MessageError::Stage(crate::eip::StageError {
+            code: "test".to_string(),
+            message: "test".to_string(),
+            retryable: false,
+        });
+    }
+
+    #[test]
+    fn test_batch_partial_failure_with_message_error() {
+        // Test creating BatchPartialFailure with MessageError
+        let failed_messages = vec![
+            (
+                serde_json::json!({"id": 1}),
+                MessageError::Validation(ValidationError::new("invalid id")),
+            ),
+            (
+                serde_json::json!({"id": 2}),
+                MessageError::JsonDecode(
+                    serde_json::from_str::<serde_json::Value>("invalid").unwrap_err(),
+                ),
+            ),
+        ];
+
+        let batch_failure = BatchPartialFailure::new(10, failed_messages);
+
+        assert_eq!(batch_failure.total_count, 10);
+        assert_eq!(batch_failure.failed_count, 2);
+        assert_eq!(batch_failure.failed_messages.len(), 2);
+
+        // Test that we can convert BatchPartialFailure to ProcessingError
+        let proc_err: ProcessingError = batch_failure.into();
+        assert!(matches!(proc_err, ProcessingError::BatchPartialFailure(_)));
+    }
+
+    #[test]
+    fn test_message_error_display_formatting() {
+        // Test that MessageError formats correctly (should match ProcessingError formatting)
+        let msg_err = MessageError::Validation(ValidationError::new("test message"));
+        let formatted = format!("{}", msg_err);
+        assert_eq!(formatted, "validation failed: test message");
+
+        let msg_err2 = MessageError::JsonDecode(
+            serde_json::from_str::<serde_json::Value>("invalid").unwrap_err(),
+        );
+        let formatted2 = format!("{}", msg_err2);
+        assert!(formatted2.contains("json decode error"));
+    }
+
+    #[test]
+    fn test_round_trip_conversion() {
+        // Test that MessageError -> ProcessingError -> MessageError works for non-BatchPartialFailure variants
+        let original_stage = crate::eip::StageError {
+            code: "test_code".to_string(),
+            message: "test message".to_string(),
+            retryable: true,
+        };
+        let original_msg_err = MessageError::Stage(original_stage.clone());
+
+        let proc_err: ProcessingError = original_msg_err.into();
+        let converted_back = MessageError::try_from(proc_err).unwrap();
+
+        match converted_back {
+            MessageError::Stage(conv) => {
+                assert_eq!(original_stage.code, conv.code);
+                assert_eq!(original_stage.message, conv.message);
+                assert_eq!(original_stage.retryable, conv.retryable);
+            }
+            _ => panic!("Expected Stage variant"),
+        }
     }
 }
