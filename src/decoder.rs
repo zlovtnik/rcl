@@ -52,6 +52,37 @@ fn unwrap_debezium(value: Value) -> Result<Value, ProcessingError> {
     }
 }
 
+/// Ensures all dotted-path fields declared in the pipeline are present and not null in the JSON value.
+///
+/// Traverses each path in `pipeline.required_fields` (dot-separated segments) and returns an error if any
+/// segment is missing or has a `null` value.
+///
+/// # Parameters
+///
+/// - `value`: The JSON document to validate.
+/// - `pipeline`: Pipeline configuration whose `required_fields` lists dot-separated paths that must exist in `value`.
+///
+/// # Errors
+///
+/// Returns `ValidationError` with message `missing required field `<path>``
+—where `<path>` is the required dotted path—if any required field is absent or `null`.
+///
+/// # Examples
+///
+/// ```
+/// use serde_json::json;
+///
+/// let value = json!({
+///     "user": { "id": 1, "name": "alice" }
+/// });
+///
+/// let pipeline = PipelineConfig {
+///     required_fields: vec!["user.id".into(), "user.name".into()],
+///     ..Default::default()
+/// };
+///
+/// assert!(validate_required_fields(&value, &pipeline).is_ok());
+/// ```
 fn validate_required_fields(
     value: &Value,
     pipeline: &PipelineConfig,
@@ -80,6 +111,16 @@ mod tests {
     use crate::eip::BackpressureConfig;
     use serde_json::json;
 
+    /// Creates a test PipelineConfig with the specified Debezium envelope flag and required fields.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let cfg = make_pipeline(true, vec!["id", "name"]);
+    /// assert_eq!(cfg.name, "test");
+    /// assert!(cfg.debezium_envelope);
+    /// assert!(cfg.required_fields.contains(&"name".to_string()));
+    /// ```
     fn make_pipeline(debezium: bool, required: Vec<&str>) -> PipelineConfig {
         PipelineConfig {
             name: "test".to_string(),

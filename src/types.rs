@@ -70,6 +70,18 @@ impl MessageContext {
         }
     }
 
+    /// Creates a correlation identifier combining the message's topic, partition, and offset.
+    ///
+    /// # Returns
+    ///
+    /// A `String` in the format `<topic>:<partition>:<offset>`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let ctx = MessageContext::new("topic".to_string(), 1, 42, 0);
+    /// assert_eq!(ctx.correlation_id(), "topic:1:42");
+    /// ```
     pub fn correlation_id(&self) -> String {
         format!("{}:{}:{}", self.topic, self.partition, self.offset)
     }

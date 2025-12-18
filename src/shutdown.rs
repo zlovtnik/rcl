@@ -36,10 +36,23 @@ impl ShutdownCoordinator {
         self.notify_shutdown.subscribe()
     }
 
-    /// Asynchronously waits for a termination signal and broadcasts shutdown to all subscribers.
+    /// Waits for an operating-system termination signal and then broadcasts a shutdown notification to all subscribers.
     ///
-    /// On Unix systems, listens for SIGTERM and Ctrl+C signals. On non-Unix systems, listens only for Ctrl+C.
-    /// This method will block until a signal is received, then send a notification to all subscribers.
+    /// On Unix, this listens for SIGTERM and Ctrl+C; on non-Unix platforms, it listens only for Ctrl+C. After a signal is received, a unit `()` is sent on the internal broadcast channel to notify all subscribers.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tokio::sync::broadcast;
+    /// // Create a coordinator and subscribe to shutdown notifications.
+    /// let (coord, mut rx) = crate::ShutdownCoordinator::new();
+    ///
+    /// // Simulate a shutdown by sending directly on the sender (useful for tests).
+    /// let _ = coord.notify_shutdown.send(());
+    ///
+    /// // The receiver will receive the unit value sent above.
+    /// assert_eq!(rx.try_recv().unwrap(), ());
+    /// ```
     pub async fn wait_for_signal(&self) {
         let ctrl_c = async {
             signal::ctrl_c()

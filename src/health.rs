@@ -113,6 +113,28 @@ impl HealthRegistry {
         Ok(())
     }
 
+    /// Computes the current SystemHealth by combining component statuses and per-pipeline health.
+    ///
+    /// The returned SystemHealth contains:
+    /// - `status`: overall system status (Unhealthy > Degraded > Healthy). Kafka or Postgres being `Unhealthy` forces overall `Unhealthy`; `Degraded` promotes overall status to `Degraded` only if no `Unhealthy` is present. Pipeline health is evaluated inline and can also promote the overall status.
+    /// - `kafka` and `postgres`: current component statuses read from the registry.
+    /// - `pipelines`: cloned pipeline health entries; any pipeline that has not had activity within the registry's timeout and is otherwise `Healthy` is marked `Degraded` and given `last_error = Some("Pipeline stalled")`.
+    ///
+    /// Lock poisoning is handled by recovering the inner values when reading shared state.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use chrono::Utc;
+    ///
+    /// let registry = HealthRegistry::new(Duration::from_secs(60));
+    /// registry.register_pipeline("p1".to_string());
+    /// let system = registry.get_status();
+    /// assert_eq!(system.kafka, ComponentStatus::Healthy);
+    /// assert_eq!(system.postgres, ComponentStatus::Healthy);
+    /// assert!(system.pipelines.contains_key("p1"));
+    /// ```
     pub fn get_status(&self) -> SystemHealth {
         let kafka = self
             .kafka_status

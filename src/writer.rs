@@ -101,6 +101,22 @@ pub trait WriterTrait: Send + Sync {
 
 #[async_trait]
 impl WriterTrait for Writer {
+    /// Write a single JSON record to the specified Postgres table and record the operation under the given pipeline.
+    ///
+    /// The `value` is the JSON record to persist; `table` is the target table identifier (optionally schema-qualified); `pipeline_name` is used for metrics and health tracking.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` on success, `Err(ProcessingError)` on failure.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn example(writer: &crate::Writer) {
+    /// let value = serde_json::json!({"data": {"id": 1, "name": "alice"}, "operation_type": "c"});
+    /// writer.write(&value, "public.events", "ingest_pipeline").await.unwrap();
+    /// # }
+    /// ```
     async fn write(
         &self,
         value: &Value,
@@ -110,6 +126,28 @@ impl WriterTrait for Writer {
         Writer::write(self, value, table, pipeline_name).await
     }
 
+    /// Writes a batch of JSON records to the specified Postgres table for a pipeline.
+    ///
+    /// This performs the writer's batch write operation for the provided `values` into `table` on behalf
+    /// of `pipeline_name`.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` on success, `Err(ProcessingError)` if the write fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use serde_json::json;
+    /// # use my_crate::{Writer, ProcessingError};
+    /// # #[tokio::test]
+    /// async fn example_write_batch() -> Result<(), ProcessingError> {
+    ///     let writer = /* construct Writer with test config */;
+    ///     let values = vec![json!({"data": 1}), json!({"data": 2})];
+    ///     writer.write_batch(&values, "events", "pipeline_a").await?;
+    ///     Ok(())
+    /// }
+    /// ```
     async fn write_batch(
         &self,
         values: &[Value],
@@ -121,6 +159,29 @@ impl WriterTrait for Writer {
 }
 
 impl Writer {
+    /// Create a new Writer connected to Postgres using the provided configuration.
+    ///
+    /// Establishes a PgPool configured from `cfg` (including optional SSL settings and pool options),
+    /// updates the given `health` registry to reflect the connection status, and returns a `Writer`
+    /// that uses `metrics` and `health`.
+    ///
+    /// # Returns
+    ///
+    /// A `Writer` backed by a live Postgres connection pool configured according to `cfg`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use tokio;
+    /// # async fn _example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let cfg = Arc::new(/* construct PostgresConfig */);
+    /// let metrics = /* construct Metrics */;
+    /// let health = Arc::new(/* construct HealthRegistry */);
+    /// let writer = crate::writer::Writer::new(cfg, metrics, health).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn new(
         cfg: Arc<PostgresConfig>,
         metrics: Metrics,
@@ -273,6 +334,27 @@ impl Writer {
     }
 }
 
+/// Streams a batch of JSON records into a Postgres table using COPY FROM STDIN (CSV).
+///
+/// Each `Value` is converted to a JSON payload and written alongside metadata columns
+/// (`ingest_system_time`, `_meta_topic`, `_meta_partition`, `_meta_offset`, `_meta_ingest_ts`).
+/// The function validates `table` as a safe identifier to prevent SQL injection and maps
+/// transport or serialization errors to `ProcessingError`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use serde_json::json;
+/// use sqlx::PgConnection;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let values = vec![json!({"data": "x", "operation_type": "c"})];
+/// // Obtain a real PgConnection in production code.
+/// let mut conn: PgConnection = todo!("obtain a live PgConnection");
+/// copy_into(&mut conn, "my_schema.my_table", &values).await?;
+/// # Ok(())
+/// # }
+/// ```
 async fn copy_into(
     conn: &mut PgConnection,
     table: &str,

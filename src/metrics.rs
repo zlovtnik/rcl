@@ -30,6 +30,26 @@ pub struct Metrics {
 }
 
 impl Metrics {
+    /// Create and register all Prometheus metrics and return an initialized `Metrics` instance.
+    ///
+    /// This function constructs each metric used by the metrics subsystem, registers them with
+    /// the provided `Registry`, and returns a `Metrics` struct containing the registered handles.
+    /// Registration errors from Prometheus primitives are propagated to the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error produced while creating or registering metrics with the given `Registry`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use prometheus::Registry;
+    /// // Assume `Metrics` is in scope from the same crate
+    /// let registry = Registry::new();
+    /// let metrics = Metrics::register(&registry).unwrap();
+    /// // Newly created counters start at zero
+    /// assert_eq!(metrics.messages_total.get(), 0);
+    /// ```
     pub fn register(registry: &Registry) -> Result<Self> {
         let messages_total =
             IntCounter::with_opts(Opts::new("messages_total", "Messages consumed"))?;
@@ -142,6 +162,38 @@ fn metrics_handler(registry: Registry) -> Result<String, String> {
     String::from_utf8(buffer).map_err(|e| e.to_string())
 }
 
+/// Starts an HTTP server that exposes Prometheus metrics and health endpoints on the given port.
+///
+/// The server binds to 0.0.0.0 and provides:
+/// - `GET /metrics`: Prometheus text format metrics (`text/plain; version=0.0.4`) or 500 on error.
+/// - `GET /health`: returns the literal `"ok"`.
+/// - `GET /ready`: returns the service health as JSON; responds 200 for `Healthy` or `Degraded`, 503 for `Unhealthy`, or 500 on serialization error.
+///
+/// Errors encountered while binding or serving are logged but do not panic the caller.
+///
+/// # Parameters
+///
+/// - `registry`: Prometheus registry whose metrics will be served at `/metrics`.
+/// - `health`: shared health registry used to produce the `/ready` response.
+/// - `port`: TCP port to bind the exporter to (server listens on 0.0.0.0:port).
+///
+/// # Returns
+///
+/// A `JoinHandle<()>` for the spawned Tokio task running the HTTP exporter.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::Arc;
+/// use prometheus::Registry;
+///
+/// // Create a registry and a health registry (types shown for illustration).
+/// let registry = Registry::new();
+/// let health = Arc::new(crate::health::HealthRegistry::new());
+///
+/// // Spawn exporter on port 9100.
+/// let _handle = crate::metrics::spawn_exporter(registry, health, 9100);
+/// ```
 pub fn spawn_exporter(
     registry: Registry,
     health: Arc<HealthRegistry>,
@@ -593,6 +645,16 @@ mod tests {
         assert_eq!(metrics.batch_bytes_total.get(), 3072);
     }
 
+    /// Verifies that the `batch_flush_total` counter records increments for multiple labeled flush reasons.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let registry = prometheus::Registry::new();
+    /// let metrics = crate::metrics::Metrics::register(&registry).unwrap();
+    /// metrics.batch_flush_total.with_label_values(&["timeout"]).inc_by(3.0);
+    /// assert_eq!(metrics.batch_flush_total.with_label_values(&["timeout"]).get(), 3);
+    /// ```
     #[test]
     fn test_metrics_multiple_flush_reasons() {
         let registry = Registry::new();

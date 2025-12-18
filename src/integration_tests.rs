@@ -79,7 +79,18 @@ mod tests {
         assert!(true, "✓ Time-based flush mechanism available");
     }
 
-    /// Test size-based flush trigger mechanism
+    /// Verifies the presence of a size-based batching flush trigger.
+    ///
+    /// This test asserts that a batcher can be configured to flush when a batch
+    /// reaches a configured maximum number of messages (size-based flush).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Placeholder example demonstrating the test's assertion.
+    /// // In the integration suite this represents checking that the mechanism exists.
+    /// assert!(true, "✓ Size-based flush mechanism available");
+    /// ```
     #[test]
     fn test_batching_size_based_flush() {
         // BatcherConfig.max_batch_size controls size-based flush
@@ -110,7 +121,38 @@ mod tests {
     // VERIFICATION 2.4.3: Basic DLQ Functionality
     // ============================================================================
 
-    /// Test DLQ message structure validation
+    /// Validates that a Dead Letter Queue (DLQ) message contains `value`, `metadata`, and `error` fields
+    /// and that the error `code` is `DECODE_ERROR`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use serde_json::json;
+    ///
+    /// let original_payload = json!({ "id": 123, "name": "test_user" });
+    /// let dlq_message = json!({
+    ///     "value": original_payload,
+    ///     "metadata": {
+    ///         "topic": "cdc.users",
+    ///         "partition": 0,
+    ///         "offset": 1000,
+    ///         "ingest_timestamp": 1700000000000i64,
+    ///     },
+    ///     "error": {
+    ///         "code": "DECODE_ERROR",
+    ///         "message": "Invalid JSON format",
+    ///         "retryable": false
+    ///     }
+    /// });
+    ///
+    /// assert!(dlq_message.get("value").is_some());
+    /// assert!(dlq_message.get("metadata").is_some());
+    /// assert!(dlq_message.get("error").is_some());
+    /// assert_eq!(
+    ///     dlq_message.get("error").and_then(|e| e.get("code")).and_then(|c| c.as_str()),
+    ///     Some("DECODE_ERROR")
+    /// );
+    /// ```
     #[test]
     fn test_dlq_message_format() {
         // Create a sample error message that would be sent to DLQ
@@ -147,7 +189,38 @@ mod tests {
         );
     }
 
-    /// Test error classification (retryable vs permanent)
+    /// Verifies that DLQ error objects correctly indicate whether an error is retryable.
+    ///
+    /// Constructs example error payloads and asserts the `retryable` boolean is present and
+    /// reflects transient (`true`) versus permanent (`false`) error classification.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use serde_json::json;
+    ///
+    /// let retryable = json!({
+    ///     "code": "TRANSPORT_ERROR",
+    ///     "message": "Database connection lost",
+    ///     "retryable": true
+    /// });
+    ///
+    /// let permanent = json!({
+    ///     "code": "VALIDATION_ERROR",
+    ///     "message": "Required field missing",
+    ///     "retryable": false
+    /// });
+    ///
+    /// assert!(retryable
+    ///     .get("retryable")
+    ///     .and_then(|v| v.as_bool())
+    ///     .unwrap_or(false));
+    ///
+    /// assert!(!permanent
+    ///     .get("retryable")
+    ///     .and_then(|v| v.as_bool())
+    ///     .unwrap_or(false));
+    /// ```
     #[test]
     fn test_dlq_error_classification() {
         // Retryable errors (e.g., transient DB failures)
