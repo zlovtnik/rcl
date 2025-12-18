@@ -14,10 +14,18 @@ pub enum LogLevel {
     Error,
 }
 
-impl LogLevel {
-}
-
 impl std::fmt::Display for LogLevel {
+    /// Formats a `LogLevel` as its lowercase textual representation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crate::LogLevel;
+    /// assert_eq!(format!("{}", LogLevel::Debug), "debug");
+    /// assert_eq!(format!("{}", LogLevel::Info), "info");
+    /// assert_eq!(format!("{}", LogLevel::Warn), "warn");
+    /// assert_eq!(format!("{}", LogLevel::Error), "error");
+    /// ```
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             LogLevel::Debug => "debug",
@@ -55,6 +63,27 @@ impl ServiceConfig {
     }
 }
 
+/// Parse a duration string expressed in seconds.
+///
+/// Accepts a string with an optional trailing `s` suffix; interprets the numeric portion as seconds.
+///
+/// # Returns
+///
+/// A `Duration` representing the parsed number of seconds.
+///
+/// # Errors
+///
+/// Returns a `ParseIntError` if the numeric portion of the input cannot be parsed as an unsigned integer.
+///
+/// # Examples
+///
+/// ```
+/// let d = parse_duration("45s").unwrap();
+/// assert_eq!(d.as_secs(), 45);
+///
+/// let d2 = parse_duration("10").unwrap();
+/// assert_eq!(d2.as_secs(), 10);
+/// ```
 fn parse_duration(s: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
     if s.ends_with('s') {
         let secs: u64 = s.trim_end_matches('s').parse()?;
@@ -63,6 +92,433 @@ fn parse_duration(s: &str) -> Result<std::time::Duration, std::num::ParseIntErro
         // fallback to seconds if no suffix
         let secs: u64 = s.parse()?;
         Ok(std::time::Duration::from_secs(secs))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_duration_with_s() {
+        let d = parse_duration("45s").unwrap();
+        assert_eq!(d.as_secs(), 45);
+    }
+
+    #[test]
+    fn test_parse_duration_plain_number() {
+        let d = parse_duration("10").unwrap();
+        assert_eq!(d.as_secs(), 10);
+    }
+
+    #[test]
+    fn test_parse_duration_invalid() {
+        assert!(parse_duration("1m").is_err());
+    }
+
+    #[test]
+    fn test_service_shutdown_timeout_duration() {
+        let svc = ServiceConfig {
+            log_level: LogLevel::Info,
+            metrics_port: 9000,
+            otlp_endpoint: None,
+            health_check_timeout_ms: 5000,
+            shutdown_timeout: "60s".to_string(),
+        };
+        let dur = svc.shutdown_timeout_duration();
+        assert_eq!(dur.as_secs(), 60);
+    }
+
+    #[test]
+    fn test_loglevel_display() {
+        assert_eq!(LogLevel::Debug.to_string(), "debug");
+        assert_eq!(LogLevel::Info.to_string(), "info");
+        assert_eq!(LogLevel::Warn.to_string(), "warn");
+        assert_eq!(LogLevel::Error.to_string(), "error");
+    }
+
+    #[test]
+    fn test_loglevel_equality() {
+        assert_eq!(LogLevel::Info, LogLevel::Info);
+        assert_ne!(LogLevel::Info, LogLevel::Debug);
+    }
+
+    #[test]
+    fn test_service_config_with_otlp_endpoint() {
+        let svc = ServiceConfig {
+            log_level: LogLevel::Debug,
+            metrics_port: 8080,
+            otlp_endpoint: Some("http://localhost:4317".to_string()),
+            health_check_timeout_ms: 3000,
+            shutdown_timeout: "30s".to_string(),
+        };
+        assert_eq!(svc.metrics_port, 8080);
+        assert!(svc.otlp_endpoint.is_some());
+    }
+
+    #[test]
+    fn test_postgres_pool_config_validation_valid() {
+        let cfg = PostgresPoolConfig {
+            max_connections: 10,
+            acquire_timeout_ms: 5000,
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_postgres_pool_config_validation_zero_connections() {
+        let cfg = PostgresPoolConfig {
+            max_connections: 0,
+            acquire_timeout_ms: 5000,
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_postgres_pool_config_validation_zero_timeout() {
+        let cfg = PostgresPoolConfig {
+            max_connections: 10,
+            acquire_timeout_ms: 0,
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_postgres_config_validation_with_pool() {
+        let cfg = PostgresConfig {
+            url: "postgres://localhost/db".to_string(),
+            ssl_mode: None,
+            ssl_root_cert: None,
+            pool: Some(PostgresPoolConfig {
+                max_connections: 20,
+                acquire_timeout_ms: 10000,
+            }),
+            copy_enabled: true,
+            copy_batch_rows: 1000,
+            insert_batch_rows: 100,
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_postgres_config_validation_invalid_pool() {
+        let cfg = PostgresConfig {
+            url: "postgres://localhost/db".to_string(),
+            ssl_mode: None,
+            ssl_root_cert: None,
+            pool: Some(PostgresPoolConfig {
+                max_connections: 0,
+                acquire_timeout_ms: 10000,
+            }),
+            copy_enabled: true,
+            copy_batch_rows: 1000,
+            insert_batch_rows: 100,
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_table_identifier_simple() {
+        assert!(validate_table_identifier("users").is_ok());
+        assert!(validate_table_identifier("orders").is_ok());
+        assert!(validate_table_identifier("_temp").is_ok());
+    }
+
+    /// Verifies that schema-qualified table identifiers with valid schema and table parts are accepted.
+    ///
+    /// This test asserts that identifiers like `"public.users"`, `"staging.orders"`, and `"schema_1.table_1"` pass validation.
+    #[test]
+    fn test_validate_table_identifier_with_schema() {
+        assert!(validate_table_identifier("public.users").is_ok());
+        assert!(validate_table_identifier("staging.orders").is_ok());
+        assert!(validate_table_identifier("schema_1.table_1").is_ok());
+    }
+
+    #[test]
+    fn test_validate_table_identifier_single_char() {
+        assert!(validate_table_identifier("a").is_ok());
+        assert!(validate_table_identifier("_").is_ok());
+        assert!(validate_table_identifier("a.b").is_ok());
+    }
+
+    #[test]
+    fn test_validate_table_identifier_empty() {
+        assert!(validate_table_identifier("").is_err());
+    }
+
+    #[test]
+    fn test_validate_table_identifier_invalid_start() {
+        assert!(validate_table_identifier("1users").is_err());
+        assert!(validate_table_identifier("-table").is_err());
+    }
+
+    #[test]
+    fn test_validate_table_identifier_invalid_chars() {
+        assert!(validate_table_identifier("user-data").is_err());
+        assert!(validate_table_identifier("user data").is_err());
+        assert!(validate_table_identifier("user;data").is_err());
+        assert!(validate_table_identifier("user'data").is_err());
+    }
+
+    #[test]
+    fn test_validate_table_identifier_too_many_dots() {
+        assert!(validate_table_identifier("a.b.c").is_err());
+    }
+
+    #[test]
+    fn test_validate_table_identifier_empty_parts() {
+        assert!(validate_table_identifier(".table").is_err());
+        assert!(validate_table_identifier("schema.").is_err());
+    }
+
+    #[test]
+    fn test_validate_table_identifier_too_long() {
+        let long = "a".repeat(64);
+        assert!(validate_table_identifier(&long).is_err());
+
+        let long_with_schema = format!("a.{}", "b".repeat(64));
+        assert!(validate_table_identifier(&long_with_schema).is_err());
+    }
+
+    #[test]
+    fn test_validate_table_identifier_sql_injection_attempts() {
+        assert!(validate_table_identifier("users; DROP TABLE users;--").is_err());
+        assert!(validate_table_identifier("users' OR '1'='1").is_err());
+        assert!(validate_table_identifier("users/**/").is_err());
+    }
+
+    #[test]
+    fn test_config_validation_empty_pipelines() {
+        let mut cfg = create_valid_config();
+        cfg.pipelines.clear();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_empty_pipeline_name() {
+        let mut cfg = create_valid_config();
+        cfg.pipelines[0].name = "".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_duplicate_pipeline_names() {
+        let mut cfg = create_valid_config();
+        cfg.pipelines.push(cfg.pipelines[0].clone());
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_empty_pipeline_topic() {
+        let mut cfg = create_valid_config();
+        cfg.pipelines[0].topic = "".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_duplicate_topics() {
+        let mut cfg = create_valid_config();
+        let mut pipeline2 = cfg.pipelines[0].clone();
+        pipeline2.name = "pipeline2".to_string();
+        cfg.pipelines.push(pipeline2);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_invalid_staging_table() {
+        let mut cfg = create_valid_config();
+        cfg.pipelines[0].staging_table = "123invalid".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_zero_metrics_port() {
+        let mut cfg = create_valid_config();
+        cfg.service.metrics_port = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_zero_health_check_timeout() {
+        let mut cfg = create_valid_config();
+        cfg.service.health_check_timeout_ms = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_empty_kafka_brokers() {
+        let mut cfg = create_valid_config();
+        cfg.kafka.brokers = "".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_empty_kafka_group_id() {
+        let mut cfg = create_valid_config();
+        cfg.kafka.group_id = "".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_zero_session_timeout() {
+        let mut cfg = create_valid_config();
+        cfg.kafka.session_timeout_ms = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_zero_inflight_messages() {
+        let mut cfg = create_valid_config();
+        cfg.kafka.max_inflight_messages = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_negative_producer_retries() {
+        let mut cfg = create_valid_config();
+        cfg.kafka.producer_retries = -1;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_zero_dlq_message_timeout() {
+        let mut cfg = create_valid_config();
+        cfg.kafka.dlq_message_timeout_ms = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_empty_compression() {
+        let mut cfg = create_valid_config();
+        cfg.kafka.compression = "".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_invalid_fetch_config() {
+        let mut cfg = create_valid_config();
+        cfg.kafka.fetch = Some(KafkaFetchConfig {
+            max_bytes: 0,
+            max_wait_ms: 100,
+        });
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_dlq_empty_topic() {
+        let mut cfg = create_valid_config();
+        cfg.pipelines[0].dlq = Some(crate::eip::DlqConfig {
+            topic: "".to_string(),
+            max_retries: 3,
+            max_payload_bytes: 1_000_000,
+        });
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_dlq_zero_retries() {
+        let mut cfg = create_valid_config();
+        cfg.pipelines[0].dlq = Some(crate::eip::DlqConfig {
+            topic: "dlq".to_string(),
+            max_retries: 0,
+            max_payload_bytes: 1_000_000,
+        });
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_dlq_zero_payload_bytes() {
+        let mut cfg = create_valid_config();
+        cfg.pipelines[0].dlq = Some(crate::eip::DlqConfig {
+            topic: "dlq".to_string(),
+            max_retries: 3,
+            max_payload_bytes: 0,
+        });
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_zero_channel_capacity() {
+        let mut cfg = create_valid_config();
+        cfg.pipelines[0].backpressure.channel_capacity = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_empty_required_fields() {
+        let mut cfg = create_valid_config();
+        cfg.pipelines[0].required_fields.clear();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_blank_required_field() {
+        let mut cfg = create_valid_config();
+        cfg.pipelines[0].required_fields = vec!["   ".to_string()];
+        assert!(cfg.validate().is_err());
+    }
+
+    // Helper to create a valid config for validation tests
+    /// Creates a pre-filled, valid Config configured for tests.
+    ///
+    /// The returned Config is populated with sensible defaults for ServiceConfig, KafkaConfig, PostgresConfig (including a PostgresPoolConfig), and a single PipelineConfig named "test-pipeline"; it is intended to pass `Config::validate`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let cfg = create_valid_config();
+    /// assert!(cfg.validate().is_ok());
+    /// assert_eq!(cfg.pipelines.len(), 1);
+    /// ```
+    fn create_valid_config() -> Config {
+        Config {
+            service: ServiceConfig {
+                log_level: LogLevel::Info,
+                metrics_port: 9090,
+                otlp_endpoint: None,
+                health_check_timeout_ms: 5000,
+                shutdown_timeout: "30s".to_string(),
+            },
+            kafka: KafkaConfig {
+                brokers: "localhost:9092".to_string(),
+                group_id: "test-group".to_string(),
+                security: None,
+                fetch: None,
+                session_timeout_ms: 45000,
+                max_inflight_messages: 500,
+                producer_retries: 3,
+                dlq_message_timeout_ms: 15000,
+                compression: "lz4".to_string(),
+                dlq_readiness_timeout_secs: 30,
+                dlq_readiness_backoff_secs: 1,
+                staleness_threshold_seconds: 300,
+            },
+            postgres: PostgresConfig {
+                url: "postgres://localhost/test".to_string(),
+                ssl_mode: None,
+                ssl_root_cert: None,
+                pool: Some(PostgresPoolConfig {
+                    max_connections: 10,
+                    acquire_timeout_ms: 5000,
+                }),
+                copy_enabled: true,
+                copy_batch_rows: 5000,
+                insert_batch_rows: 500,
+            },
+            pipelines: vec![PipelineConfig {
+                name: "test-pipeline".to_string(),
+                topic: "test-topic".to_string(),
+                debezium_envelope: false,
+                staging_table: "test_table".to_string(),
+                dlq: None,
+                stages: vec![],
+                required_fields: vec!["id".to_string()],
+                backpressure: crate::eip::BackpressureConfig {
+                    channel_capacity: 20000,
+                },
+                batching: Default::default(),
+            }],
+        }
     }
 }
 

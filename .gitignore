@@ -9,3 +9,10 @@ coverage/
 node_modules/
 .idea/
 .vscode/
+# Coverage reports
+cobertura.xml
+*.xml
+*.profraw
+*.profdata
+tarpaulin-report.html
+tarpaulin/

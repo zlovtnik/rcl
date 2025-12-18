@@ -2,13 +2,14 @@ use crate::eip::{Stage, StageContext, StageError, StageResult};
 use crate::errors::{ProcessingError, ValidationError};
 use anyhow::Result;
 use async_trait::async_trait;
+use redis::aio::MultiplexedConnection;
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
-use redis::aio::MultiplexedConnection;
 
 /// Filter Stage - Skip messages that don't match criteria
+#[derive(Debug)]
 pub struct FilterStage {
     #[allow(dead_code)]
     name: String,
@@ -202,6 +203,7 @@ impl Stage for FilterStage {
 }
 
 /// Transformer Stage - Modify message structure and content
+#[derive(Debug)]
 pub struct TransformerStage {
     #[allow(dead_code)]
     name: String,
@@ -216,6 +218,7 @@ enum Transformation {
     RemoveField { name: String },
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Debug)]
 enum Converter {
     ToDecimal,
@@ -351,17 +354,49 @@ impl Transformation {
 }
 
 impl Converter {
+    /// Convert a JSON `Value` into the type indicated by this `Converter`.
+    ///
+    /// `ToDecimal` expects a string containing a floating-point number and produces
+    /// `Value::Number` from that decimal; it fails if parsing fails or the value is
+    /// NaN or infinite. `ToInteger` expects a string containing an integer and
+    /// produces `Value::Number` from that integer; it fails if parsing fails.
+    /// `ToString` returns the string representation of the input value.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(Value)` with the converted JSON value on success, `Err(ProcessingError)`
+    /// if the input type is not supported for the selected conversion or if parsing
+    /// the numeric value fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use serde_json::json;
+    ///
+    /// // ToDecimal
+    /// let conv = crate::stages::Converter::ToDecimal;
+    /// let res = conv.convert(json!("3.14")).unwrap();
+    /// assert!(res.is_number());
+    ///
+    /// // ToInteger
+    /// let conv = crate::stages::Converter::ToInteger;
+    /// let res = conv.convert(json!("42")).unwrap();
+    /// assert!(res.is_number());
+    ///
+    /// // ToString
+    /// let conv = crate::stages::Converter::ToString;
+    /// let res = conv.convert(json!(true)).unwrap();
+    /// assert_eq!(res, json!("true"));
+    /// ```
     fn convert(&self, value: Value) -> Result<Value, ProcessingError> {
         match self {
             Converter::ToDecimal => {
                 if let Value::String(s) = value {
                     let f: f64 = s.parse().map_err(|e| {
-                        ProcessingError::Stage(
-                            StageError::new(
-                                "conversion_error",
-                                format!("Parse decimal error: {}", e),
-                            )
-                        )
+                        ProcessingError::Stage(StageError::new(
+                            "conversion_error",
+                            format!("Parse decimal error: {}", e),
+                        ))
                     })?;
                     let num = serde_json::Number::from_f64(f).ok_or_else(|| {
                         ProcessingError::Stage(StageError::new(
@@ -437,6 +472,7 @@ impl Stage for TransformerStage {
 }
 
 /// Router Stage - Route messages to different destinations
+#[derive(Debug)]
 pub struct RouterStage {
     #[allow(dead_code)]
     name: String,
@@ -528,6 +564,7 @@ impl Stage for RouterStage {
 }
 
 /// Splitter Stage - Split one message into many
+#[derive(Debug)]
 pub struct SplitterStage {
     #[allow(dead_code)]
     name: String,
@@ -736,13 +773,40 @@ trait DeduplicationStorage: Send + Sync {
 }
 
 struct RedisStorage {
-    client: MultiplexedConnection,
+    client: redis::Client,
+    connection: tokio::sync::OnceCell<MultiplexedConnection>,
 }
 
 #[async_trait]
 impl DeduplicationStorage for RedisStorage {
+    /// Atomically records a key in Redis with a TTL and indicates whether the key was newly created.
+    ///
+    /// Attempts `SET key 1 NX EX <ttl>` and returns whether the set succeeded (meaning the key did not exist).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    /// // Assume `storage` is a RedisStorage instance available in scope.
+    /// # async fn example(storage: &crate::RedisStorage) -> Result<(), Box<dyn std::error::Error>> {
+    /// let created = storage.check_and_set("message:123", Duration::from_secs(60)).await?;
+    /// if created {
+    ///     println!("key was set (new)"); // `true` branch
+    /// } else {
+    ///     println!("key already existed"); // `false` branch
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    — `true` if the key was set (did not previously exist), `false` otherwise.
     async fn check_and_set(&self, key: &str, ttl: Duration) -> Result<bool> {
-        let mut conn = self.client.clone();
+        let conn = self
+            .connection
+            .get_or_try_init(|| async { self.client.get_multiplexed_async_connection().await })
+            .await?;
+
+        let mut conn = conn.clone();
         let result: Option<String> = redis::cmd("SET")
             .arg(key)
             .arg("1")
@@ -756,6 +820,7 @@ impl DeduplicationStorage for RedisStorage {
 }
 
 pub struct IdempotentReceiverStage {
+    #[allow(dead_code)]
     name: String,
     key_field: String,
     storage: Box<dyn DeduplicationStorage>,
@@ -764,6 +829,35 @@ pub struct IdempotentReceiverStage {
 }
 
 impl IdempotentReceiverStage {
+    /// Constructs an IdempotentReceiverStage from a JSON configuration.
+    ///
+    /// The configuration must contain a `key_field` (string) used to extract the deduplication key from messages.
+    /// Optional fields:
+    /// - `ttl_seconds` (u64): time-to-live for deduplication keys in seconds (default 86400).
+    /// - `storage` (string): deduplication backend; currently `"redis"` is supported (default `"redis"`).
+    /// - `redis_url` (string): Redis connection URL (default `"redis://localhost:6379"`).
+    /// - `fallback_on_error` (string): behavior when storage errors occur; `"pass"` (default) or `"fail"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Err` if `key_field` is missing or if an unsupported `storage` type is provided,
+    /// or if creating the configured storage backend fails (for example, invalid Redis URL).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use serde_json::json;
+    ///
+    /// let cfg = json!({
+    ///     "key_field": "message_id",
+    ///     "ttl_seconds": 3600,
+    ///     "storage": "redis",
+    ///     "redis_url": "redis://127.0.0.1:6379",
+    ///     "fallback_on_error": "pass"
+    /// });
+    /// let stage = IdempotentReceiverStage::from_config("idemp".to_string(), cfg).unwrap();
+    /// assert_eq!(stage.name(), "idemp");
+    /// ```
     pub fn from_config(name: String, config: Value) -> Result<Self> {
         let key_field = config
             .get("key_field")
@@ -790,14 +884,17 @@ impl IdempotentReceiverStage {
                     .and_then(|v| v.as_str())
                     .unwrap_or("redis://localhost:6379");
                 let client = redis::Client::open(redis_url)?;
-                let conn = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        client.get_multiplexed_async_connection().await
-                    })
-                })?;
-                Box::new(RedisStorage { client: conn })
+                Box::new(RedisStorage {
+                    client,
+                    connection: tokio::sync::OnceCell::new(),
+                })
             }
-            _ => return Err(anyhow::anyhow!("unsupported storage type: {}", storage_type)),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "unsupported storage type: {}",
+                    storage_type
+                ))
+            }
         };
 
         let fallback = match config
@@ -822,14 +919,45 @@ impl IdempotentReceiverStage {
 
 #[async_trait]
 impl Stage for IdempotentReceiverStage {
-    async fn process(&self, _ctx: &StageContext, msg: Value) -> Result<StageResult, ProcessingError> {
-        let key = if let Some(Value::String(field_value)) = msg.get(&self.key_field) {
-            field_value.clone()
-        } else {
-            return Err(ProcessingError::Validation(ValidationError::new(format!(
-                "key field '{}' not found or not a string",
-                self.key_field
-            ))));
+    /// Deduplicates a message by checking and recording its configured key and then deciding the stage outcome.
+    ///
+    /// Extracts the key from the configured `key_field` in the message; if the key is missing or not a string, returns a validation error.
+    /// If the storage reports the key as new, continues with the message; if the key is already present, the message is skipped.
+    /// If the storage operation fails, behavior is controlled by the stage's `fallback`:
+    /// - `FallbackMode::Pass` logs a warning and continues with the message.
+    /// - `FallbackMode::Fail` returns a stage processing error.
+    ///
+    /// # Returns
+    ///
+    /// `StageResult::Continue(msg)` if the message is considered new or fallback permits passing, `StageResult::Skip` if a duplicate was detected, or an appropriate `ProcessingError` on validation failure or fallback-triggered failure.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use tokio::runtime::Runtime;
+    /// # async fn _example(stage: &impl crate::stages::Stage, ctx: &crate::stages::StageContext, msg: serde_json::Value) {
+    /// let result = stage.process(ctx, msg).await;
+    /// match result {
+    ///     Ok(crate::stages::StageResult::Continue(_)) => println!("message accepted"),
+    ///     Ok(crate::stages::StageResult::Skip) => println!("duplicate message skipped"),
+    ///     Err(e) => eprintln!("processing error: {}", e),
+    /// }
+    /// # }
+    /// ```
+    async fn process(
+        &self,
+        _ctx: &StageContext,
+        msg: Value,
+    ) -> Result<StageResult, ProcessingError> {
+        let key = match get_field(&msg, &self.key_field) {
+            Some(Value::String(field_value)) => field_value.clone(),
+            _ => {
+                return Err(ProcessingError::Validation(ValidationError::new(format!(
+                    "key field '{}' not found or not a string",
+                    self.key_field
+                ))));
+            }
         };
 
         match self.storage.check_and_set(&key, self.ttl).await {
@@ -847,7 +975,7 @@ impl Stage for IdempotentReceiverStage {
                 }
                 FallbackMode::Fail => Err(ProcessingError::Stage(StageError::new(
                     "deduplication check failed",
-                    &format!("{}", e),
+                    e.to_string(),
                 ))),
             },
         }
@@ -1017,5 +1145,396 @@ mod tests {
             }
             _ => panic!("Expected Split result"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_transformer_conversions_and_add_remove() {
+        let stage = TransformerStage {
+            name: "test".to_string(),
+            transformations: vec![
+                Transformation::Convert {
+                    field: "n1".to_string(),
+                    converter: Converter::ToDecimal,
+                },
+                Transformation::Convert {
+                    field: "n2".to_string(),
+                    converter: Converter::ToInteger,
+                },
+                Transformation::Convert {
+                    field: "x".to_string(),
+                    converter: Converter::ToString,
+                },
+                Transformation::AddField {
+                    name: "now_ts".to_string(),
+                    value: ValueGenerator::Now,
+                },
+                Transformation::RemoveField {
+                    name: "remove_me".to_string(),
+                },
+            ],
+        };
+
+        let ctx = StageContext {
+            correlation_id: "test".to_string(),
+            pipeline_name: "test".to_string(),
+            message_metadata: crate::eip::MessageMetadata::from_kafka(
+                "test".to_string(),
+                0,
+                0,
+                None,
+            ),
+        };
+
+        let msg = json!({"n1": "3.14", "n2": "42", "x": 10, "remove_me": "bye"});
+        let result = stage.process(&ctx, msg).await.unwrap();
+        match result {
+            StageResult::Continue(new_msg) => {
+                // n1 should be number
+                assert!(new_msg.get("n1").and_then(|v| v.as_f64()).is_some());
+                // n2 should be integer number
+                assert!(new_msg.get("n2").and_then(|v| v.as_i64()).is_some());
+                // x should be string
+                assert!(new_msg.get("x").and_then(|v| v.as_str()).is_some());
+                // now_ts exists
+                assert!(new_msg.get("now_ts").is_some());
+                // remove_me removed
+                assert!(new_msg.get("remove_me").is_none());
+            }
+            _ => panic!("Expected Continue result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_condition_operators() {
+        // contains
+        let cond = Condition {
+            field: "a".to_string(),
+            operator: Operator::Contains("ell".to_string()),
+        };
+        assert!(cond.evaluate(&json!({"a": "hello"})));
+
+        // regex
+        let cond = Condition {
+            field: "a".to_string(),
+            operator: Operator::Regex(regex::Regex::new("^h.*o$").unwrap()),
+        };
+        assert!(cond.evaluate(&json!({"a": "hello"})));
+
+        // in
+        let cond = Condition {
+            field: "a".to_string(),
+            operator: Operator::In(vec![json!(1), json!(2), json!(3)]),
+        };
+        assert!(cond.evaluate(&json!({"a": 2})));
+
+        // greater/less than
+        let cond = Condition {
+            field: "n".to_string(),
+            operator: Operator::GreaterThan(5.0),
+        };
+        assert!(cond.evaluate(&json!({"n": 6})));
+        let cond = Condition {
+            field: "n".to_string(),
+            operator: Operator::LessThan(5.0),
+        };
+        assert!(cond.evaluate(&json!({"n": 4})));
+
+        // exists
+        let cond = Condition {
+            field: "z".to_string(),
+            operator: Operator::Exists,
+        };
+        assert!(cond.evaluate(&json!({"z": null}))); // exists even if null
+    }
+
+    struct MockStorage {
+        ret: Result<bool, String>,
+    }
+
+    #[async_trait]
+    impl DeduplicationStorage for MockStorage {
+        /// Return the mocked check-and-set outcome stored in `self.ret`.
+        ///
+        /// This async method maps an internal `Result<bool, String>` (`self.ret`) to
+        /// `Result<bool, anyhow::Error>`: if `self.ret` is `Ok(b)` it yields `Ok(b)`,
+        /// otherwise it yields an `Err` wrapping the stored error string.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// // assumed: `storage` implements the method shown and is available in scope.
+        /// // Await the mocked result and unwrap the boolean success indicator:
+        /// let was_new = storage.check_and_set("key", std::time::Duration::from_secs(60)).await.unwrap();
+        /// assert!(was_new == true || was_new == false);
+        /// ```
+        async fn check_and_set(&self, _key: &str, _ttl: std::time::Duration) -> Result<bool> {
+            match &self.ret {
+                Ok(b) => Ok(*b),
+                Err(s) => Err(anyhow::anyhow!(s.clone())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_idempotent_receiver_stage_pass_and_skip() {
+        let storage_new = MockStorage { ret: Ok(true) };
+        let stage = IdempotentReceiverStage {
+            name: "idemp".to_string(),
+            key_field: "id".to_string(),
+            storage: Box::new(storage_new),
+            ttl: std::time::Duration::from_secs(60),
+            fallback: FallbackMode::Pass,
+        };
+
+        let ctx = StageContext {
+            correlation_id: "c".to_string(),
+            pipeline_name: "p".to_string(),
+            message_metadata: crate::eip::MessageMetadata::from_kafka("t".to_string(), 0, 0, None),
+        };
+
+        let msg = json!({"id": "abc"});
+        let res = stage.process(&ctx, msg.clone()).await.unwrap();
+        assert!(matches!(res, StageResult::Continue(_)));
+
+        let storage_dup = MockStorage { ret: Ok(false) };
+        let stage2 = IdempotentReceiverStage {
+            storage: Box::new(storage_dup),
+            ..stage
+        };
+        let res2 = stage2.process(&ctx, msg).await.unwrap();
+        assert!(matches!(res2, StageResult::Skip));
+    }
+
+    #[tokio::test]
+    async fn test_idempotent_receiver_stage_error_fallback() {
+        let storage_err: MockStorage = MockStorage {
+            ret: Err("boom".to_string()),
+        };
+        let stage = IdempotentReceiverStage {
+            name: "idemp".to_string(),
+            key_field: "id".to_string(),
+            storage: Box::new(storage_err),
+            ttl: std::time::Duration::from_secs(60),
+            fallback: FallbackMode::Pass,
+        };
+
+        let ctx = StageContext {
+            correlation_id: "c".to_string(),
+            pipeline_name: "p".to_string(),
+            message_metadata: crate::eip::MessageMetadata::from_kafka("t".to_string(), 0, 0, None),
+        };
+
+        let msg = json!({"id": "abc"});
+        // With fallback=Pass, error should result in Continue
+        let res = stage.process(&ctx, msg).await.unwrap();
+        assert!(matches!(res, StageResult::Continue(_)));
+    }
+
+    #[test]
+    fn test_filter_stage_from_config_invalid_mode() {
+        let config = json!({
+            "mode": "invalid_mode",
+            "conditions": [
+                {
+                    "field": "status",
+                    "equals": "active"
+                }
+            ],
+            "logic": "AND"
+        });
+        let result = FilterStage::from_config("test".to_string(), config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid filter mode"));
+    }
+
+    #[test]
+    fn test_filter_stage_from_config_invalid_logic() {
+        let config = json!({
+            "mode": "include",
+            "conditions": [
+                {
+                    "field": "status",
+                    "equals": "active"
+                }
+            ],
+            "logic": "INVALID"
+        });
+        let result = FilterStage::from_config("test".to_string(), config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid logic"));
+    }
+
+    #[test]
+    fn test_filter_stage_from_config_missing_conditions() {
+        let config = json!({
+            "mode": "include",
+            "logic": "AND"
+        });
+        let result = FilterStage::from_config("test".to_string(), config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("missing conditions"));
+    }
+
+    #[test]
+    fn test_filter_stage_from_config_missing_field() {
+        let config = json!({
+            "mode": "include",
+            "conditions": [
+                {
+                    "equals": "active"
+                }
+            ],
+            "logic": "AND"
+        });
+        let result = FilterStage::from_config("test".to_string(), config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("missing field"));
+    }
+
+    #[test]
+    fn test_filter_stage_from_config_no_valid_operator() {
+        let config = json!({
+            "mode": "include",
+            "conditions": [
+                {
+                    "field": "status"
+                }
+            ],
+            "logic": "AND"
+        });
+        let result = FilterStage::from_config("test".to_string(), config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no valid operator"));
+    }
+
+    #[test]
+    fn test_filter_stage_from_config_invalid_regex() {
+        let config = json!({
+            "mode": "include",
+            "conditions": [
+                {
+                    "field": "status",
+                    "regex": "["
+                }
+            ],
+            "logic": "AND"
+        });
+        let result = FilterStage::from_config("test".to_string(), config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_transformer_stage_from_config_invalid_type() {
+        let config = json!({
+            "transformations": [
+                {
+                    "type": "unknown_type",
+                    "name": "field"
+                }
+            ]
+        });
+        let result = TransformerStage::from_config("test".to_string(), config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_router_stage_from_config_missing_field() {
+        let config = json!({
+            "routes": {
+                "a": "b"
+            },
+            "default": "c"
+        });
+        let result = RouterStage::from_config("test".to_string(), config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_splitter_stage_from_config_missing_field() {
+        let config = json!({
+            "array_size_limit": 100
+        });
+        let result = SplitterStage::from_config("test".to_string(), config);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_condition_operators_all_variants() {
+        let _ctx = StageContext {
+            correlation_id: "test".to_string(),
+            pipeline_name: "test".to_string(),
+            message_metadata: crate::eip::MessageMetadata::from_kafka(
+                "test".to_string(),
+                0,
+                0,
+                None,
+            ),
+        };
+
+        // Test NotEquals
+        let msg = json!({"status": "inactive"});
+        let cond = Condition {
+            field: "status".to_string(),
+            operator: Operator::NotEquals(json!("active")),
+        };
+        assert!(cond.evaluate(&msg));
+
+        // Test GreaterThan
+        let msg = json!({"age": 25});
+        let cond = Condition {
+            field: "age".to_string(),
+            operator: Operator::GreaterThan(20.0),
+        };
+        assert!(cond.evaluate(&msg));
+
+        // Test LessThan
+        let msg = json!({"age": 15});
+        let cond = Condition {
+            field: "age".to_string(),
+            operator: Operator::LessThan(20.0),
+        };
+        assert!(cond.evaluate(&msg));
+
+        // Test Contains
+        let msg = json!({"description": "hello world"});
+        let cond = Condition {
+            field: "description".to_string(),
+            operator: Operator::Contains("world".to_string()),
+        };
+        assert!(cond.evaluate(&msg));
+
+        // Test Regex
+        let regex = Regex::new("^[0-9]+$").unwrap();
+        let msg = json!({"value": "12345"});
+        let cond = Condition {
+            field: "value".to_string(),
+            operator: Operator::Regex(regex),
+        };
+        assert!(cond.evaluate(&msg));
+
+        // Test Exists
+        let msg = json!({"field": null});
+        let cond = Condition {
+            field: "field".to_string(),
+            operator: Operator::Exists,
+        };
+        assert!(cond.evaluate(&msg));
+
+        // Test In
+        let msg = json!({"status": "active"});
+        let cond = Condition {
+            field: "status".to_string(),
+            operator: Operator::In(vec![json!("active"), json!("pending")]),
+        };
+        assert!(cond.evaluate(&msg));
     }
 }

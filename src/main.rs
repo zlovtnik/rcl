@@ -6,6 +6,7 @@ mod dlq;
 mod eip;
 mod errors;
 mod health;
+mod integration_tests;
 mod load_test;
 mod logging;
 mod metrics;
@@ -80,6 +81,16 @@ enum DlqAction {
     },
 }
 
+/// Application entry point that parses CLI arguments, loads configuration, initializes logging, and dispatches the selected subcommand (`Run`, `Replay`, `Dlq`, or `LoadTest`).
+///
+/// The function exits early if `--validate-config` is provided after printing a validation message.
+///
+/// # Examples
+///
+/// ```no_run
+/// // Start the service with default behavior
+/// // cargo run --bin my_service
+/// ```
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -108,7 +119,8 @@ async fn main() -> Result<()> {
             let health = Arc::new(HealthRegistry::new(std::time::Duration::from_millis(
                 cfg.service.health_check_timeout_ms,
             )));
-            let writer = Arc::new(Writer::new(writer_cfg, metrics.clone(), health).await?);
+            let writer: Arc<Writer> =
+                Arc::new(Writer::new(writer_cfg, metrics.clone(), health).await?);
 
             consumer::replay(
                 cfg,
@@ -131,6 +143,22 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Starts the ingestion service: initializes health and metrics, constructs the writer and consumer, and coordinates graceful shutdown.
+///
+/// On completion returns success when the consumer finishes within the configured shutdown timeout; otherwise returns an error.
+///
+/// # Errors
+///
+/// Returns an error if initialization fails, if the consumer task fails to join, or if shutdown times out.
+///
+/// # Examples
+///
+/// ```no_run
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let cfg = /* build or load Config */ unimplemented!();
+/// run_service(cfg).await?;
+/// # Ok(()) }
+/// ```
 async fn run_service(cfg: Config) -> Result<()> {
     let health = Arc::new(HealthRegistry::new(std::time::Duration::from_millis(
         cfg.service.health_check_timeout_ms,
@@ -142,7 +170,8 @@ async fn run_service(cfg: Config) -> Result<()> {
     let cfg = Arc::new(cfg);
     let shutdown_timeout = cfg.service.shutdown_timeout_duration();
     let writer_cfg = Arc::new(cfg.postgres.clone());
-    let writer = Arc::new(Writer::new(writer_cfg, metrics.clone(), health.clone()).await?);
+    let writer: Arc<Writer> =
+        Arc::new(Writer::new(writer_cfg, metrics.clone(), health.clone()).await?);
 
     let (coordinator, shutdown_rx) = shutdown::ShutdownCoordinator::new();
 
