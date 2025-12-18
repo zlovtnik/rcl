@@ -64,8 +64,7 @@ fn unwrap_debezium(value: Value) -> Result<Value, ProcessingError> {
 ///
 /// # Errors
 ///
-/// Returns `ValidationError` with message `missing required field `<path>``
-—where `<path>` is the required dotted path—if any required field is absent or `null`.
+/// Returns `ValidationError` with message `missing required field <path>` where `<path>` is the required dotted path if any required field is absent or `null`.
 ///
 /// # Examples
 ///

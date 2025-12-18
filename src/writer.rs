@@ -82,7 +82,6 @@ pub struct Writer {
 }
 
 #[async_trait]
-#[allow(dead_code)]
 pub trait WriterTrait: Send + Sync {
     async fn write(
         &self,

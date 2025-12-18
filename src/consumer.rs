@@ -30,7 +30,7 @@ use rdkafka::TopicPartitionList;
 
 struct ConsumerContext {
     consumer: Arc<StreamConsumer>,
-    batcher: Arc<tokio::sync::Mutex<Batcher>>,
+    batcher: Option<Arc<tokio::sync::Mutex<Batcher>>>,
     metrics: Metrics,
     health: Arc<HealthRegistry>,
     pipelines_by_topic: HashMap<String, Pipeline>,
@@ -50,8 +50,10 @@ impl ConsumerContext {
         message: Value,
         context: &MessageContext,
     ) -> Result<(), ProcessingError> {
-        let mut batcher = self.batcher.lock().await;
-        batcher
+        let batcher = self.batcher.as_ref()
+            .ok_or_else(|| ProcessingError::Validation(ValidationError::new("batcher not available".to_string())))?;
+        let mut batcher_guard = batcher.lock().await;
+        batcher_guard
             .add_message(pipeline_name, table, message, context.clone())
             .await
     }
@@ -550,7 +552,7 @@ async fn run_committed_offsets_handler(
 /// ```
 pub async fn replay(
     cfg: Arc<Config>,
-    writer: Arc<Writer>,
+    _writer: Arc<Writer>,
     _metrics: Metrics,
     topic: String,
     partition: i32,
@@ -587,21 +589,14 @@ pub async fn replay(
         topic, partition, start_offset, end_offset
     );
 
-    // For replay, we'll use the writer directly since batching isn't needed
-    let (dummy_tx, _) = tokio::sync::mpsc::unbounded_channel::<HashMap<(String, i32), i64>>();
+    // For replay, we use the writer directly without batching, so batcher is None
     let context = ConsumerContext {
         consumer: Arc::new(consumer),
-        batcher: Arc::new(tokio::sync::Mutex::new(Batcher::new(
-            BatcherConfig::default(),
-            writer.clone(),
-            _metrics.clone(),
-            &ShutdownCoordinator::default(),
-            dummy_tx,
-        ))), // Not used in replay
+        batcher: None,
         metrics: _metrics,
-        health: Arc::new(HealthRegistry::new(Duration::from_secs(30))), // Not used in replay
+        health: Arc::new(HealthRegistry::new(Duration::from_secs(30))),
         pipelines_by_topic,
-        producer: None, // DLQ not used in replay
+        producer: None,
     };
 
     let mut stream = context.consumer.stream();
@@ -757,7 +752,7 @@ pub async fn run(
 
     let context = ConsumerContext {
         consumer: consumer.clone(),
-        batcher: batcher.clone(),
+        batcher: Some(batcher.clone()),
         metrics: metrics.clone(),
         health: health.clone(),
         pipelines_by_topic,

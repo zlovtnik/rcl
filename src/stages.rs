@@ -799,7 +799,7 @@ impl DeduplicationStorage for RedisStorage {
     /// # }
     /// ```
     ///
-    — `true` if the key was set (did not previously exist), `false` otherwise.
+    /// Returns `true` if the key was set (did not previously exist), `false` otherwise.
     async fn check_and_set(&self, key: &str, ttl: Duration) -> Result<bool> {
         let conn = self
             .connection
