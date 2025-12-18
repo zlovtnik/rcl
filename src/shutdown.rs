@@ -31,6 +31,7 @@ impl ShutdownCoordinator {
     /// Returns a new receiver for shutdown notifications.
     ///
     /// Callers can use this to subscribe to shutdown events.
+    #[allow(dead_code)]
     pub fn subscribe(&self) -> broadcast::Receiver<()> {
         self.notify_shutdown.subscribe()
     }

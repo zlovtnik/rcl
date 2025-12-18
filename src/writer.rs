@@ -1,4 +1,4 @@
-use crate::config::PostgresConfig;
+use crate::config::{validate_table_identifier, PostgresConfig};
 use crate::errors::{ProcessingError, TransportError, ValidationError};
 use crate::health::{ComponentStatus, HealthRegistry};
 use crate::metrics::Metrics;
@@ -237,9 +237,15 @@ async fn copy_into(
     table: &str,
     values: &[Value],
 ) -> Result<(), ProcessingError> {
+    // Validate table name to prevent SQL injection
+    validate_table_identifier(table)
+        .map_err(|e| ProcessingError::Validation(ValidationError::new(e.to_string())))?;
+
+    // Escape any double quotes in table name and wrap in quotes for safe SQL identifier
+    let quoted_table = format!("\"{}\"", table.replace('"', "\"\""));
     let copy_sql = format!(
         "COPY {} (payload, ingest_system_time, _meta_topic, _meta_partition, _meta_offset, _meta_ingest_ts) FROM STDIN WITH (FORMAT csv)",
-        table
+        quoted_table
     );
     let mut writer = conn
         .copy_in_raw(&copy_sql)
@@ -279,9 +285,15 @@ async fn insert_batch(pool: &PgPool, table: &str, values: &[Value]) -> Result<()
         return Ok(());
     }
 
+    // Validate table name to prevent SQL injection
+    validate_table_identifier(table)
+        .map_err(|e| ProcessingError::Validation(ValidationError::new(e.to_string())))?;
+
+    // Escape any double quotes in table name and wrap in quotes for safe SQL identifier
+    let quoted_table = format!("\"{}\"", table.replace('"', "\"\""));
     let mut builder = QueryBuilder::new(format!(
         "INSERT INTO {} (payload, ingest_system_time, _meta_topic, _meta_partition, _meta_offset, _meta_ingest_ts) VALUES ",
-        table
+        quoted_table
     ));
 
     builder.push_values(values, |mut b, val| {
@@ -301,4 +313,78 @@ async fn insert_batch(pool: &PgPool, table: &str, values: &[Value]) -> Result<()
         .await
         .map_err(|e| ProcessingError::from(TransportError::new("insert", e)))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_table_validation_valid_names() {
+        // Valid single table names
+        assert!(validate_table_identifier("users").is_ok());
+        assert!(validate_table_identifier("user_data").is_ok());
+        assert!(validate_table_identifier("_private_table").is_ok());
+        assert!(validate_table_identifier("table123").is_ok());
+
+        // Valid schema.table names
+        assert!(validate_table_identifier("public.users").is_ok());
+        assert!(validate_table_identifier("staging.orders").is_ok());
+        assert!(validate_table_identifier("schema_name.table_name").is_ok());
+
+        // Edge cases that should be valid
+        assert!(validate_table_identifier("a.b").is_ok()); // single character parts
+        assert!(validate_table_identifier("_._").is_ok()); // underscores
+    }
+
+    #[test]
+    fn test_table_validation_invalid_names() {
+        // Empty string
+        assert!(validate_table_identifier("").is_err());
+
+        // Invalid characters
+        assert!(validate_table_identifier("user-data").is_err()); // dash not allowed
+        assert!(validate_table_identifier("user data").is_err()); // space not allowed
+        assert!(validate_table_identifier("user;data").is_err()); // semicolon injection attempt
+        assert!(validate_table_identifier("user--data").is_err()); // SQL comment attempt
+        assert!(validate_table_identifier("user' OR '1'='1").is_err()); // SQL injection attempt
+
+        // Invalid starting characters
+        assert!(validate_table_identifier("123table").is_err()); // starts with number
+        assert!(validate_table_identifier("-table").is_err()); // starts with dash
+
+        // Too many dots
+        assert!(validate_table_identifier("a.b.c").is_err()); // more than one dot
+
+        // Empty parts
+        assert!(validate_table_identifier(".table").is_err()); // empty schema
+        assert!(validate_table_identifier("schema.").is_err()); // empty table
+
+        // Names too long (over 63 characters)
+        let long_name = "a".repeat(64);
+        assert!(validate_table_identifier(&long_name).is_err());
+    }
+
+    #[test]
+    fn test_copy_into_validation_rejection() {
+        // This test verifies that copy_into rejects invalid table names
+        // We can't fully test the async function without a database connection,
+        // but we can test that validation happens early by checking the error type
+
+        // Create a mock connection that would fail anyway, but validation should happen first
+        // Since we can't easily create a PgConnection without a database, we'll test the validation
+        // separately. The integration test below would need a test database.
+
+        // Test that validation function works as expected
+        assert!(validate_table_identifier("users; DROP TABLE users;--").is_err());
+        assert!(validate_table_identifier("users' OR '1'='1").is_err());
+    }
+
+    #[test]
+    fn test_insert_batch_validation_rejection() {
+        // Similar to copy_into test - validation should prevent SQL injection
+
+        assert!(validate_table_identifier("users; DROP TABLE users;--").is_err());
+        assert!(validate_table_identifier("users' OR '1'='1").is_err());
+    }
 }

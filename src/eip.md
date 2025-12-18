@@ -1024,13 +1024,14 @@ use tokio::time::timeout;
 
 pub struct RhaiScriptEngine {
     engine: Arc<Engine>,
+    host_functions: Arc<dyn HostFunctions + Send + Sync>,
     timeout: Duration,
     memory_limit: usize,
     gas_limit: u64,
 }
 
 impl RhaiScriptEngine {
-    pub fn new(config: &ScriptConfig) -> Result<Self> {
+    pub fn new(config: &ScriptConfig, host_functions: Arc<dyn HostFunctions + Send + Sync>) -> Result<Self> {
         let mut engine = Engine::new();
 
         // Configure engine limits
@@ -1040,28 +1041,34 @@ impl RhaiScriptEngine {
         engine.set_max_array_size(config.max_array_size.unwrap_or(10000));
 
         // Register host functions
-        register_host_functions(&mut engine)?;
+        register_host_functions(&mut engine, host_functions.clone())?;
 
         Ok(Self {
             engine: Arc::new(engine),
+            host_functions,
             timeout: config.timeout.unwrap_or(Duration::from_millis(100)),
             memory_limit: config.memory_limit.unwrap_or(1024 * 1024), // 1MB
             gas_limit: config.gas_limit.unwrap_or(10000),
         })
     }
 
-    fn register_host_functions(engine: &mut Engine) -> Result<()> {
-        // Logging functions
-        engine.register_fn("log", |msg: &str| {
-            tracing::info!("script log: {}", msg);
+    fn register_host_functions(engine: &mut Engine, host_functions: Arc<dyn HostFunctions + Send + Sync>) -> Result<()> {
+        // Logging functions - forward to host functions
+        let hf_log = host_functions.clone();
+        engine.register_fn("log", move |msg: &str| -> Result<(), Box<rhai::EvalAltResult>> {
+            hf_log.log(msg).map_err(|e| format!("Log error: {}", e).into())
         });
 
-        engine.register_fn("warn", |msg: &str| {
-            tracing::warn!("script warn: {}", msg);
+        let hf_warn = host_functions.clone();
+        engine.register_fn("warn", move |msg: &str| -> Result<(), Box<rhai::EvalAltResult>> {
+            // Assuming warn is available on host_functions, otherwise use log
+            hf_warn.log(msg).map_err(|e| format!("Warn error: {}", e).into())
         });
 
-        engine.register_fn("error", |msg: &str| {
-            tracing::error!("script error: {}", msg);
+        let hf_error = host_functions.clone();
+        engine.register_fn("error", move |msg: &str| -> Result<(), Box<rhai::EvalAltResult>> {
+            // Assuming error is available on host_functions, otherwise use log
+            hf_error.log(msg).map_err(|e| format!("Error error: {}", e).into())
         });
 
         // Time functions (deterministic)
@@ -1125,9 +1132,7 @@ impl ScriptEngine for RhaiScriptEngine {
             scope.push(key, dynamic);
         }
 
-        // Expose host functions via context
-        let log_fn = context.host_functions.log.as_ref();
-        scope.push("log", rhai::FnPtr::new("log", log_fn));
+
 
         // Execute with timeout
         let engine = self.engine.clone();
@@ -1181,6 +1186,8 @@ impl CompiledScript for CompiledRhaiScript {
             let dynamic = rhai_json_to_dynamic(value)?;
             scope.push(key, dynamic);
         }
+
+        // Host functions are already registered globally on the engine, no need to push them to scope
 
         let result = timeout(self.timeout, async move {
             self.engine.eval_ast_with_scope::<Dynamic>(&mut scope, &self.ast)
@@ -1352,12 +1359,12 @@ impl Writer {
     pub async fn write(&self, value: &Value, table: &str) -> Result<(), ProcessingError> {
         // Clean metadata fields before writing
         let mut cleaned = value.clone();
-        remove_metadata_fields(&mut cleaned);
-        
+        self.remove_metadata_fields(&mut cleaned);
+
         self.write_to_table(&cleaned, table).await
     }
-    
-    fn remove_metadata_fields(value: &mut Value) {
+
+    fn remove_metadata_fields(&mut self, value: &mut Value) {
         if let Value::Object(obj) = value {
             obj.remove("_destination_table");
             obj.remove("_correlation_id");
@@ -1455,9 +1462,3 @@ mod integration_tests {
     }
 }
 ```
-
----
-
-## 7. Performance Considerations
-
-### 7.1 Caching Strategy

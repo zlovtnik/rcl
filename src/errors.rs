@@ -6,6 +6,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum ProcessingError {
     /// Raised when a message is missing the expected payload bytes.
+    #[allow(dead_code)]
     #[error("missing payload")]
     MissingPayload,
     /// Raised when payload bytes cannot be converted to UTF-8.

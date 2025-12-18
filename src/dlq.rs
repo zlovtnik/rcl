@@ -242,9 +242,22 @@ pub async fn drain(
                                         .payload(&dlq_msg.payload)
                                         .key(&key);
 
-                                    p.send(record, Duration::from_secs(5)).await.map_err(
-                                        |(e, _)| anyhow::anyhow!("requeue failed: {}", e),
-                                    )?;
+                                    match p.send(record, Duration::from_secs(5)).await {
+                                        Ok(_) => {
+                                            println!(
+                                                "Requeued message from offset {} to {}",
+                                                msg.offset(),
+                                                dlq_msg.context.topic
+                                            );
+                                        }
+                                        Err((e, _)) => {
+                                            eprintln!(
+                                                "Failed to requeue message at offset {}: {}",
+                                                msg.offset(),
+                                                e
+                                            );
+                                        }
+                                    }
                                     println!(
                                         "Requeued message from offset {} to {}",
                                         msg.offset(),

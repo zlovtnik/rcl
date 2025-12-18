@@ -21,7 +21,6 @@ pub struct Metrics {
     pub write_latency_seconds: Histogram,
     pub batch_size: Histogram,
     pub last_poll_timestamp: IntGauge,
-    registry: Registry,
 }
 
 impl Metrics {
@@ -72,7 +71,6 @@ impl Metrics {
             write_latency_seconds,
             batch_size,
             last_poll_timestamp,
-            registry: registry.clone(),
         })
     }
 }

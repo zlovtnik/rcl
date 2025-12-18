@@ -47,6 +47,12 @@ Access Prometheus metrics at `http://localhost:9090/metrics`.
 - [ ] **Security**: TLS enabled for Kafka and Postgres. Secrets loaded from env vars.
 - [ ] **Observability**: Prometheus scraping configured. Alerts set for `rcl_lag_ms` > 10s and `rcl_processing_failures` > 0.
 - [ ] **Reliability**: DLQ topic exists and is monitored.
-- [ ] **Database**: Staging tables created with `_meta_*` columns.
+- [ ] **Database**: Staging tables created with required metadata columns (see [sql/staging_tables.sql](sql/staging_tables.sql)):
+  - `_meta_topic TEXT` (nullable) - Kafka source topic name
+  - `_meta_partition BIGINT` (nullable) - Kafka partition number
+  - `_meta_offset BIGINT` (nullable) - Kafka offset
+  - `_meta_ingest_ts BIGINT` (nullable) - Ingest timestamp (milliseconds since epoch)
+  
+  These columns enable traceability and support replay operations. See example schema at [sql/staging_tables.sql](sql/staging_tables.sql) for reference implementation.
 - [ ] **Capacity**: `ulimit -n` increased for open files (Kafka/Postgres connections).
 - [ ] **Recovery**: Tested `replay` command for a range of offsets.

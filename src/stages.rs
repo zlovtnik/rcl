@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 /// Filter Stage - Skip messages that don't match criteria
 pub struct FilterStage {
+    #[allow(dead_code)]
     name: String,
     mode: FilterMode,
     conditions: Vec<Condition>,
@@ -200,6 +201,7 @@ impl Stage for FilterStage {
 
 /// Transformer Stage - Modify message structure and content
 pub struct TransformerStage {
+    #[allow(dead_code)]
     name: String,
     transformations: Vec<Transformation>,
 }
@@ -357,7 +359,6 @@ impl Converter {
                                 "conversion_error",
                                 format!("Parse decimal error: {}", e),
                             )
-                            .retryable(true),
                         )
                     })?;
                     let num = serde_json::Number::from_f64(f).ok_or_else(|| {
@@ -377,13 +378,10 @@ impl Converter {
             Converter::ToInteger => {
                 if let Value::String(s) = value {
                     let i: i64 = s.parse().map_err(|e| {
-                        ProcessingError::Stage(
-                            StageError::new(
-                                "conversion_error",
-                                format!("Parse integer error: {}", e),
-                            )
-                            .retryable(true),
-                        )
+                        ProcessingError::Stage(StageError::new(
+                            "conversion_error",
+                            format!("Parse integer error: {}", e),
+                        ))
                     })?;
                     Ok(Value::Number(serde_json::Number::from(i)))
                 } else {
@@ -438,6 +436,7 @@ impl Stage for TransformerStage {
 
 /// Router Stage - Route messages to different destinations
 pub struct RouterStage {
+    #[allow(dead_code)]
     name: String,
     route_by: String,
     routes: HashMap<String, String>,
@@ -528,6 +527,7 @@ impl Stage for RouterStage {
 
 /// Splitter Stage - Split one message into many
 pub struct SplitterStage {
+    #[allow(dead_code)]
     name: String,
     split_field: String,
     preserve_fields: Vec<String>,

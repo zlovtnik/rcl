@@ -1,11 +1,10 @@
-use crate::eip::{BackpressureConfig, DlqConfig, PipelineConfig};
+use crate::eip::PipelineConfig;
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::Path;
-use tracing::Level;
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
@@ -16,14 +15,6 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
-    pub fn as_tracing_level(&self) -> Level {
-        match self {
-            LogLevel::Debug => Level::DEBUG,
-            LogLevel::Info => Level::INFO,
-            LogLevel::Warn => Level::WARN,
-            LogLevel::Error => Level::ERROR,
-        }
-    }
 }
 
 impl std::fmt::Display for LogLevel {
@@ -348,68 +339,6 @@ impl Config {
         }
 
         Ok(())
-    }
-
-    /// Example config used for local development and as a scaffold default.
-    pub fn example() -> Self {
-        Self {
-            service: ServiceConfig {
-                log_level: LogLevel::Info,
-                metrics_port: 9090,
-                otlp_endpoint: None,
-                health_check_timeout_ms: 5000,
-                shutdown_timeout: "30s".to_string(),
-            },
-            kafka: KafkaConfig {
-                brokers: "localhost:9092".to_string(),
-                group_id: "rcloader-consumer".to_string(),
-                security: None,
-                fetch: Some(KafkaFetchConfig {
-                    max_bytes: 5_242_880,
-                    max_wait_ms: 500,
-                }),
-                session_timeout_ms: 45_000,
-                max_inflight_messages: 500,
-                producer_retries: 5,
-                dlq_message_timeout_ms: 15_000,
-                compression: "lz4".to_string(),
-                dlq_readiness_timeout_secs: 30,
-                dlq_readiness_backoff_secs: 1,
-                staleness_threshold_seconds: 300,
-            },
-            postgres: PostgresConfig {
-                url: "postgres://rcl:rcl@localhost:5432/warehouse".to_string(),
-                ssl_mode: None,
-                ssl_root_cert: None,
-                pool: Some(PostgresPoolConfig {
-                    max_connections: 10,
-                    acquire_timeout_ms: 5000,
-                }),
-                copy_enabled: true,
-                copy_batch_rows: 5_000,
-                insert_batch_rows: 500,
-            },
-            pipelines: vec![PipelineConfig {
-                name: "orders-cdc".to_string(),
-                topic: "cdc.orders".to_string(),
-                required_fields: vec![
-                    "order_id".to_string(),
-                    "op_ts".to_string(),
-                    "operation_type".to_string(),
-                ],
-                debezium_envelope: true,
-                staging_table: "stg_orders".to_string(),
-                dlq: Some(DlqConfig {
-                    topic: "dlq.orders".to_string(),
-                    max_retries: 3,
-                    max_payload_bytes: DlqConfig::DEFAULT_MAX_PAYLOAD_BYTES,
-                }),
-                backpressure: BackpressureConfig {
-                    channel_capacity: 20_000,
-                },
-                stages: vec![],
-            }],
-        }
     }
 }
 

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 /// Core abstractions for Enterprise Integration Patterns
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct StageContext {
     pub correlation_id: String,
     pub pipeline_name: String,
@@ -15,6 +16,7 @@ pub struct StageContext {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct MessageMetadata {
     pub topic: String,
     pub partition: i32,
@@ -44,6 +46,7 @@ pub enum StageResult {
     /// Split into multiple messages
     Split(Vec<Value>),
     /// Error processing (send to DLQ if configured)
+    #[allow(dead_code)]
     Error(StageError),
 }
 
@@ -68,11 +71,6 @@ impl StageError {
             retryable: false,
         }
     }
-
-    pub fn retryable(mut self, retryable: bool) -> Self {
-        self.retryable = retryable;
-        self
-    }
 }
 
 #[async_trait]
@@ -82,19 +80,23 @@ pub trait Stage: Send + Sync {
         -> Result<StageResult, ProcessingError>;
 
     /// Stage name for metrics/logging
+    #[allow(dead_code)]
     fn name(&self) -> &str;
 
     /// Initialize stage (setup connections, caches, etc.)
+    #[allow(dead_code)]
     async fn initialize(&self) -> Result<(), ProcessingError> {
         Ok(())
     }
 
     /// Cleanup resources
+    #[allow(dead_code)]
     async fn shutdown(&self) -> Result<(), ProcessingError> {
         Ok(())
     }
 
     /// Health check
+    #[allow(dead_code)]
     async fn health_check(&self) -> Result<(), ProcessingError> {
         Ok(())
     }
@@ -317,22 +319,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_pipeline_filter_only() {
-        let pipeline = Pipeline {
-            name: "test-pipeline".to_string(),
-            stages: vec![create_filter_stage()],
-            config: PipelineConfig {
-                name: "test".to_string(),
-                topic: "test-topic".to_string(),
-                debezium_envelope: false,
-                staging_table: "test-table".to_string(),
-                dlq: None,
-                stages: vec![],
-                required_fields: vec![],
-                backpressure: BackpressureConfig {
-                    channel_capacity: 100,
-                },
+        let filter_def = StageDefinition {
+            name: "filter".to_string(),
+            r#type: "filter".to_string(),
+            config: json!({
+                "mode": "include",
+                "conditions": [
+                    {
+                        "field": "status",
+                        "equals": "active"
+                    }
+                ],
+                "logic": "AND"
+            }),
+        };
+
+        let config = PipelineConfig {
+            name: "test".to_string(),
+            topic: "test-topic".to_string(),
+            debezium_envelope: false,
+            staging_table: "test-table".to_string(),
+            dlq: None,
+            stages: vec![filter_def],
+            required_fields: vec![],
+            backpressure: BackpressureConfig {
+                channel_capacity: 100,
             },
         };
+
+        let pipeline = Pipeline::from_config(&config).unwrap();
 
         let ctx = create_test_context();
         let msg = json!({"status": "active", "id": 123});
@@ -344,22 +359,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_pipeline_filter_skip() {
-        let pipeline = Pipeline {
-            name: "test-pipeline".to_string(),
-            stages: vec![create_filter_stage()],
-            config: PipelineConfig {
-                name: "test".to_string(),
-                topic: "test-topic".to_string(),
-                debezium_envelope: false,
-                staging_table: "test-table".to_string(),
-                dlq: None,
-                stages: vec![],
-                required_fields: vec![],
-                backpressure: BackpressureConfig {
-                    channel_capacity: 100,
-                },
+        let filter_def = StageDefinition {
+            name: "filter".to_string(),
+            r#type: "filter".to_string(),
+            config: json!({
+                "mode": "include",
+                "conditions": [
+                    {
+                        "field": "status",
+                        "equals": "active"
+                    }
+                ],
+                "logic": "AND"
+            }),
+        };
+
+        let config = PipelineConfig {
+            name: "test".to_string(),
+            topic: "test-topic".to_string(),
+            debezium_envelope: false,
+            staging_table: "test-table".to_string(),
+            dlq: None,
+            stages: vec![filter_def],
+            required_fields: vec![],
+            backpressure: BackpressureConfig {
+                channel_capacity: 100,
             },
         };
+
+        let pipeline = Pipeline::from_config(&config).unwrap();
 
         let ctx = create_test_context();
         let msg = json!({"status": "inactive", "id": 123});
@@ -370,22 +398,49 @@ mod tests {
 
     #[tokio::test]
     async fn test_pipeline_with_transformer() {
-        let pipeline = Pipeline {
-            name: "test-pipeline".to_string(),
-            stages: vec![create_filter_stage(), create_transformer_stage()],
-            config: PipelineConfig {
-                name: "test".to_string(),
-                topic: "test-topic".to_string(),
-                debezium_envelope: false,
-                staging_table: "test-table".to_string(),
-                dlq: None,
-                stages: vec![],
-                required_fields: vec![],
-                backpressure: BackpressureConfig {
-                    channel_capacity: 100,
-                },
+        let filter_def = StageDefinition {
+            name: "filter".to_string(),
+            r#type: "filter".to_string(),
+            config: json!({
+                "mode": "include",
+                "conditions": [
+                    {
+                        "field": "status",
+                        "equals": "active"
+                    }
+                ],
+                "logic": "AND"
+            }),
+        };
+
+        let transformer_def = StageDefinition {
+            name: "transformer".to_string(),
+            r#type: "transformer".to_string(),
+            config: json!({
+                "transformations": [
+                    {
+                        "type": "add_field",
+                        "name": "processed_at",
+                        "value": "{{now}}"
+                    }
+                ]
+            }),
+        };
+
+        let config = PipelineConfig {
+            name: "test".to_string(),
+            topic: "test-topic".to_string(),
+            debezium_envelope: false,
+            staging_table: "test-table".to_string(),
+            dlq: None,
+            stages: vec![filter_def, transformer_def],
+            required_fields: vec![],
+            backpressure: BackpressureConfig {
+                channel_capacity: 100,
             },
         };
+
+        let pipeline = Pipeline::from_config(&config).unwrap();
 
         let ctx = create_test_context();
         let msg = json!({"status": "active", "id": 123});
@@ -398,22 +453,48 @@ mod tests {
 
     #[tokio::test]
     async fn test_pipeline_with_router() {
-        let pipeline = Pipeline {
-            name: "test-pipeline".to_string(),
-            stages: vec![create_filter_stage(), create_router_stage()],
-            config: PipelineConfig {
-                name: "test".to_string(),
-                topic: "test-topic".to_string(),
-                debezium_envelope: false,
-                staging_table: "test-table".to_string(),
-                dlq: None,
-                stages: vec![],
-                required_fields: vec![],
-                backpressure: BackpressureConfig {
-                    channel_capacity: 100,
+        let filter_def = StageDefinition {
+            name: "filter".to_string(),
+            r#type: "filter".to_string(),
+            config: json!({
+                "mode": "include",
+                "conditions": [
+                    {
+                        "field": "status",
+                        "equals": "active"
+                    }
+                ],
+                "logic": "AND"
+            }),
+        };
+
+        let router_def = StageDefinition {
+            name: "router".to_string(),
+            r#type: "router".to_string(),
+            config: json!({
+                "route_by": "category",
+                "routes": {
+                    "electronics": "inventory"
                 },
+                "default": "general",
+                "metadata_field": "destination"
+            }),
+        };
+
+        let config = PipelineConfig {
+            name: "test".to_string(),
+            topic: "test-topic".to_string(),
+            debezium_envelope: false,
+            staging_table: "test-table".to_string(),
+            dlq: None,
+            stages: vec![filter_def, router_def],
+            required_fields: vec![],
+            backpressure: BackpressureConfig {
+                channel_capacity: 100,
             },
         };
+
+        let pipeline = Pipeline::from_config(&config).unwrap();
 
         let ctx = create_test_context();
         let msg = json!({"status": "active", "category": "electronics", "id": 123});
@@ -421,6 +502,71 @@ mod tests {
         let results = pipeline.execute(&ctx, msg).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].get("destination"), Some(&json!("inventory")));
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_clone() {
+        let filter_def = StageDefinition {
+            name: "filter".to_string(),
+            r#type: "filter".to_string(),
+            config: json!({
+                "mode": "include",
+                "conditions": [
+                    {
+                        "field": "status",
+                        "equals": "active"
+                    }
+                ],
+                "logic": "AND"
+            }),
+        };
+
+        let transformer_def = StageDefinition {
+            name: "transformer".to_string(),
+            r#type: "transformer".to_string(),
+            config: json!({
+                "transformations": [
+                    {
+                        "type": "add_field",
+                        "name": "processed_at",
+                        "value": "{{now}}"
+                    }
+                ]
+            }),
+        };
+
+        let config = PipelineConfig {
+            name: "test".to_string(),
+            topic: "test-topic".to_string(),
+            debezium_envelope: false,
+            staging_table: "test-table".to_string(),
+            dlq: None,
+            stages: vec![filter_def, transformer_def],
+            required_fields: vec![],
+            backpressure: BackpressureConfig {
+                channel_capacity: 100,
+            },
+        };
+
+        let original_pipeline = Pipeline::from_config(&config).unwrap();
+        let cloned_pipeline = original_pipeline.clone();
+
+        // Verify the cloned pipeline has the same configuration
+        assert_eq!(original_pipeline.name, cloned_pipeline.name);
+        assert_eq!(original_pipeline.config.name, cloned_pipeline.config.name);
+        assert_eq!(original_pipeline.config.stages.len(), cloned_pipeline.config.stages.len());
+        assert_eq!(original_pipeline.stages.len(), cloned_pipeline.stages.len());
+
+        // Verify the cloned pipeline behaves identically
+        let ctx = create_test_context();
+        let msg = json!({"status": "active", "id": 123});
+
+        let original_results = original_pipeline.execute(&ctx, msg.clone()).await.unwrap();
+        let cloned_results = cloned_pipeline.execute(&ctx, msg).await.unwrap();
+
+        assert_eq!(original_results.len(), cloned_results.len());
+        assert_eq!(original_results[0].get("id"), cloned_results[0].get("id"));
+        assert!(cloned_results[0].get("processed_at").is_some());
     }
 
     #[tokio::test]

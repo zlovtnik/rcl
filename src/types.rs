@@ -60,6 +60,7 @@ pub struct MessageContext {
 }
 
 impl MessageContext {
+    #[allow(dead_code)]
     pub fn new(topic: String, partition: i32, offset: i64, timestamp: i64) -> Self {
         Self {
             topic,
