@@ -1,5 +1,6 @@
-use crate::config::PipelineConfig;
+use crate::eip::PipelineConfig;
 use crate::errors::{DebeziumError, ProcessingError, ValidationError};
+use crate::types::Operation;
 use serde_json::Value;
 
 pub fn decode_and_validate(
@@ -23,20 +24,17 @@ fn unwrap_debezium(value: Value) -> Result<Value, ProcessingError> {
         .cloned()
         .ok_or_else(|| DebeziumError::new("missing payload"))?;
 
-    let op = payload
+    let op_str = payload
         .get("op")
         .and_then(|v| v.as_str())
         .ok_or_else(|| DebeziumError::new("missing op code"))?;
 
-    let source_row = match op {
-        "c" | "r" | "u" => payload.get("after"),
-        "d" => payload.get("before"),
-        other => {
-            return Err(DebeziumError::new(format!(
-                "unsupported op code `{other}`"
-            ))
-            .into())
-        }
+    let operation = Operation::try_from(op_str)
+        .map_err(|e| DebeziumError::new(format!("invalid operation: {}", e)))?;
+
+    let source_row = match operation {
+        Operation::Create | Operation::Read | Operation::Update => payload.get("after"),
+        Operation::Delete => payload.get("before"),
     };
 
     let row = source_row
@@ -44,7 +42,10 @@ fn unwrap_debezium(value: Value) -> Result<Value, ProcessingError> {
         .ok_or_else(|| DebeziumError::new("envelope missing before/after"))?;
 
     if let Value::Object(mut obj) = row {
-        obj.insert("operation_type".to_string(), Value::String(op.to_string()));
+        obj.insert(
+            "operation_type".to_string(),
+            Value::String(operation.to_string()),
+        );
         Ok(Value::Object(obj))
     } else {
         Err(DebeziumError::new("before/after payload is not an object").into())

@@ -2,6 +2,10 @@
 CREATE TABLE IF NOT EXISTS stg_orders (
     payload JSONB NOT NULL,
     ingest_system_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    _meta_topic TEXT,
+    _meta_partition BIGINT,
+    _meta_offset BIGINT,
+    _meta_ingest_ts BIGINT,
     order_id TEXT GENERATED ALWAYS AS (payload ->> 'order_id') STORED,
     op_ts TIMESTAMPTZ GENERATED ALWAYS AS ((payload ->> 'op_ts')::timestamptz) STORED,
     operation_type TEXT GENERATED ALWAYS AS (payload ->> 'operation_type') STORED,
