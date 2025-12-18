@@ -1,0 +1,11 @@
+target/
+**/*.rs.bk
+**/*.swp
+.DS_Store
+.env
+.env.*
+/tmp/
+coverage/
+node_modules/
+.idea/
+.vscode/

@@ -1,0 +1,35 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+      http:
+
+processors:
+  batch:
+    timeout: 10s
+    send_batch_size: 1024
+
+exporters:
+  logging:
+    loglevel: info
+  otlp:
+    endpoint: ${OTEL_EXPORTER_OTLP_ENDPOINT:-https://otel-collector:4317}
+    tls:
+      insecure: ${OTEL_EXPORTER_OTLP_INSECURE:false}
+      ca_file: ${OTEL_EXPORTER_OTLP_CA_FILE:-}
+      cert_file: ${OTEL_EXPORTER_OTLP_CERT_FILE:-}
+      key_file: ${OTEL_EXPORTER_OTLP_KEY_FILE:-}
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp, logging]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp, logging]
+    logs:
+      receivers: [otlp]
+      exporters: [logging]
