@@ -33,4 +33,4 @@ uuid = { version = "1.6", features = ["v4"] }
 redis = { version = "0.25", features = ["tokio-comp"] }
 
 [dev-dependencies]
-serial_test = "3.0"
+serial_test = "3.2.0"

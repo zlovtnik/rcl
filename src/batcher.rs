@@ -6,7 +6,7 @@ use crate::shutdown::ShutdownCoordinator;
 use crate::writer::Writer;
 
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -296,7 +296,7 @@ pub struct Batcher {
     metrics: Metrics,
     shutdown_rx: broadcast::Receiver<()>,
     committed_offsets_tx: tokio::sync::mpsc::UnboundedSender<HashMap<(String, i32), i64>>,
-    recent_latencies: Vec<f64>,
+    recent_latencies: VecDeque<f64>,
 }
 
 impl Batcher {
@@ -333,7 +333,7 @@ impl Batcher {
             metrics,
             shutdown_rx: shutdown_coordinator.subscribe(),
             committed_offsets_tx,
-            recent_latencies: Vec::with_capacity(20), // pre-allocate
+            recent_latencies: VecDeque::with_capacity(20), // pre-allocate
         }
     }
 
@@ -603,9 +603,9 @@ impl Batcher {
         let latency_ms = latency.as_millis() as f64;
 
         // Add current latency to recent latencies window
-        self.recent_latencies.push(latency_ms);
+        self.recent_latencies.push_back(latency_ms);
         if self.recent_latencies.len() > self.config.latency_window_size {
-            self.recent_latencies.remove(0); // Remove oldest latency
+            self.recent_latencies.pop_front(); // Remove oldest latency in O(1) time
         }
 
         // Only adjust if we have enough latency samples
@@ -1077,7 +1077,7 @@ mod tests {
 
         // Test 2: Time-based flush trigger
         buffer.clear();
-        let mut time_config = create_test_config();
+        let time_config = create_test_config();
         let msg = create_test_message(1);
         buffer
             .add_message(msg, create_test_context(1), time_config.max_batch_bytes, None)

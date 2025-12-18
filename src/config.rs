@@ -14,8 +14,6 @@ pub enum LogLevel {
     Error,
 }
 
-impl LogLevel {}
-
 impl std::fmt::Display for LogLevel {
     /// Formats a `LogLevel` as its lowercase textual representation.
     ///
