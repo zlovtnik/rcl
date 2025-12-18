@@ -354,6 +354,40 @@ impl Transformation {
 }
 
 impl Converter {
+    /// Convert a JSON `Value` into the type indicated by this `Converter`.
+    ///
+    /// `ToDecimal` expects a string containing a floating-point number and produces
+    /// `Value::Number` from that decimal; it fails if parsing fails or the value is
+    /// NaN or infinite. `ToInteger` expects a string containing an integer and
+    /// produces `Value::Number` from that integer; it fails if parsing fails.
+    /// `ToString` returns the string representation of the input value.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(Value)` with the converted JSON value on success, `Err(ProcessingError)`
+    /// if the input type is not supported for the selected conversion or if parsing
+    /// the numeric value fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use serde_json::json;
+    ///
+    /// // ToDecimal
+    /// let conv = crate::stages::Converter::ToDecimal;
+    /// let res = conv.convert(json!("3.14")).unwrap();
+    /// assert!(res.is_number());
+    ///
+    /// // ToInteger
+    /// let conv = crate::stages::Converter::ToInteger;
+    /// let res = conv.convert(json!("42")).unwrap();
+    /// assert!(res.is_number());
+    ///
+    /// // ToString
+    /// let conv = crate::stages::Converter::ToString;
+    /// let res = conv.convert(json!(true)).unwrap();
+    /// assert_eq!(res, json!("true"));
+    /// ```
     fn convert(&self, value: Value) -> Result<Value, ProcessingError> {
         match self {
             Converter::ToDecimal => {
@@ -745,6 +779,27 @@ struct RedisStorage {
 
 #[async_trait]
 impl DeduplicationStorage for RedisStorage {
+    /// Atomically records a key in Redis with a TTL and indicates whether the key was newly created.
+    ///
+    /// Attempts `SET key 1 NX EX <ttl>` and returns whether the set succeeded (meaning the key did not exist).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    /// // Assume `storage` is a RedisStorage instance available in scope.
+    /// # async fn example(storage: &crate::RedisStorage) -> Result<(), Box<dyn std::error::Error>> {
+    /// let created = storage.check_and_set("message:123", Duration::from_secs(60)).await?;
+    /// if created {
+    ///     println!("key was set (new)"); // `true` branch
+    /// } else {
+    ///     println!("key already existed"); // `false` branch
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    — `true` if the key was set (did not previously exist), `false` otherwise.
     async fn check_and_set(&self, key: &str, ttl: Duration) -> Result<bool> {
         let conn = self
             .connection
@@ -774,6 +829,35 @@ pub struct IdempotentReceiverStage {
 }
 
 impl IdempotentReceiverStage {
+    /// Constructs an IdempotentReceiverStage from a JSON configuration.
+    ///
+    /// The configuration must contain a `key_field` (string) used to extract the deduplication key from messages.
+    /// Optional fields:
+    /// - `ttl_seconds` (u64): time-to-live for deduplication keys in seconds (default 86400).
+    /// - `storage` (string): deduplication backend; currently `"redis"` is supported (default `"redis"`).
+    /// - `redis_url` (string): Redis connection URL (default `"redis://localhost:6379"`).
+    /// - `fallback_on_error` (string): behavior when storage errors occur; `"pass"` (default) or `"fail"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `Err` if `key_field` is missing or if an unsupported `storage` type is provided,
+    /// or if creating the configured storage backend fails (for example, invalid Redis URL).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use serde_json::json;
+    ///
+    /// let cfg = json!({
+    ///     "key_field": "message_id",
+    ///     "ttl_seconds": 3600,
+    ///     "storage": "redis",
+    ///     "redis_url": "redis://127.0.0.1:6379",
+    ///     "fallback_on_error": "pass"
+    /// });
+    /// let stage = IdempotentReceiverStage::from_config("idemp".to_string(), cfg).unwrap();
+    /// assert_eq!(stage.name(), "idemp");
+    /// ```
     pub fn from_config(name: String, config: Value) -> Result<Self> {
         let key_field = config
             .get("key_field")
@@ -835,6 +919,32 @@ impl IdempotentReceiverStage {
 
 #[async_trait]
 impl Stage for IdempotentReceiverStage {
+    /// Deduplicates a message by checking and recording its configured key and then deciding the stage outcome.
+    ///
+    /// Extracts the key from the configured `key_field` in the message; if the key is missing or not a string, returns a validation error.
+    /// If the storage reports the key as new, continues with the message; if the key is already present, the message is skipped.
+    /// If the storage operation fails, behavior is controlled by the stage's `fallback`:
+    /// - `FallbackMode::Pass` logs a warning and continues with the message.
+    /// - `FallbackMode::Fail` returns a stage processing error.
+    ///
+    /// # Returns
+    ///
+    /// `StageResult::Continue(msg)` if the message is considered new or fallback permits passing, `StageResult::Skip` if a duplicate was detected, or an appropriate `ProcessingError` on validation failure or fallback-triggered failure.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use tokio::runtime::Runtime;
+    /// # async fn _example(stage: &impl crate::stages::Stage, ctx: &crate::stages::StageContext, msg: serde_json::Value) {
+    /// let result = stage.process(ctx, msg).await;
+    /// match result {
+    ///     Ok(crate::stages::StageResult::Continue(_)) => println!("message accepted"),
+    ///     Ok(crate::stages::StageResult::Skip) => println!("duplicate message skipped"),
+    ///     Err(e) => eprintln!("processing error: {}", e),
+    /// }
+    /// # }
+    /// ```
     async fn process(
         &self,
         _ctx: &StageContext,
@@ -1143,6 +1253,20 @@ mod tests {
 
     #[async_trait]
     impl DeduplicationStorage for MockStorage {
+        /// Return the mocked check-and-set outcome stored in `self.ret`.
+        ///
+        /// This async method maps an internal `Result<bool, String>` (`self.ret`) to
+        /// `Result<bool, anyhow::Error>`: if `self.ret` is `Ok(b)` it yields `Ok(b)`,
+        /// otherwise it yields an `Err` wrapping the stored error string.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// // assumed: `storage` implements the method shown and is available in scope.
+        /// // Await the mocked result and unwrap the boolean success indicator:
+        /// let was_new = storage.check_and_set("key", std::time::Duration::from_secs(60)).await.unwrap();
+        /// assert!(was_new == true || was_new == false);
+        /// ```
         async fn check_and_set(&self, _key: &str, _ttl: std::time::Duration) -> Result<bool> {
             match &self.ret {
                 Ok(b) => Ok(*b),

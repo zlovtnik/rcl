@@ -71,6 +71,22 @@ pub enum MessageError {
 
 // Conversion traits between ProcessingError and MessageError
 impl From<MessageError> for ProcessingError {
+    /// Converts a `MessageError` into the corresponding `ProcessingError`.
+    ///
+    /// The conversion maps each `MessageError` variant to the equivalent `ProcessingError` variant,
+    /// preserving any wrapped error payloads.
+    ///
+    /// # Returns
+    ///
+    /// The corresponding `ProcessingError` value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let msg_err = MessageError::MissingPayload;
+    /// let proc_err: ProcessingError = msg_err.into();
+    /// assert!(matches!(proc_err, ProcessingError::MissingPayload));
+    /// ```
     fn from(err: MessageError) -> Self {
         match err {
             MessageError::MissingPayload => ProcessingError::MissingPayload,
@@ -87,6 +103,26 @@ impl From<MessageError> for ProcessingError {
 impl TryFrom<ProcessingError> for MessageError {
     type Error = ProcessingError;
 
+    /// Converts a `ProcessingError` into a non-recursive `MessageError` when possible.
+    ///
+    /// This conversion maps each non-batch `ProcessingError` variant to the corresponding
+    /// `MessageError` variant. If the input is `ProcessingError::BatchPartialFailure`, the
+    /// conversion fails and returns the original `ProcessingError` to preserve the
+    /// non-recursion guarantee for per-message errors.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::convert::TryFrom;
+    /// // successful conversion
+    /// let pe = crate::ProcessingError::MissingPayload;
+    /// let me = MessageError::try_from(pe).expect("should convert");
+    /// matches!(me, MessageError::MissingPayload);
+    ///
+    /// // failed conversion for batch partial failure
+    /// let batch = crate::ProcessingError::BatchPartialFailure(crate::BatchPartialFailure::new(2, vec![]));
+    /// assert!(MessageError::try_from(batch).is_err());
+    /// ```
     fn try_from(err: ProcessingError) -> Result<Self, Self::Error> {
         match err {
             ProcessingError::MissingPayload => Ok(MessageError::MissingPayload),
@@ -125,6 +161,14 @@ pub struct ValidationError {
 }
 
 impl ValidationError {
+    /// Creates a new DebeziumError with the provided message.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let err = DebeziumError::new("invalid debezium envelope");
+    /// assert_eq!(err.message, "invalid debezium envelope");
+    /// ```
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -141,7 +185,20 @@ pub struct BatchPartialFailure {
 }
 
 impl BatchPartialFailure {
-    #[allow(dead_code)]
+    /// Constructs a BatchPartialFailure from the total number of messages and the list of failed messages.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use serde_json::json;
+    /// use crate::error::MessageError;
+    /// use crate::error::BatchPartialFailure;
+    ///
+    /// let failed = vec![(json!({"id": 1}), MessageError::MissingPayload)];
+    /// let bpf = BatchPartialFailure::new(3, failed);
+    /// assert_eq!(bpf.total_count, 3);
+    /// assert_eq!(bpf.failed_count, 1);
+    /// ```
     pub fn new(
         total_count: usize,
         failed_messages: Vec<(serde_json::Value, MessageError)>,
@@ -240,6 +297,21 @@ fn is_transient_db_error(err: &dyn sqlx::error::DatabaseError) -> bool {
 }
 
 impl ProcessingError {
+    /// Produces a public-facing error reason that summarizes this processing error.
+    ///
+    /// The returned `PublicErrorReason` contains a machine-friendly `code` and a
+    /// human-facing `message` suitable for exposing to clients. For `Stage` errors
+    /// the stage's own `code` and `message` are used. For `BatchPartialFailure` the
+    /// message summarizes the failed and total message counts.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let err = ProcessingError::MissingPayload;
+    /// let r = err.public_reason();
+    /// assert_eq!(r.code, "missing_payload");
+    /// assert_eq!(r.message, "payload is missing");
+    /// ```
     pub fn public_reason(&self) -> PublicErrorReason {
         match self {
             ProcessingError::MissingPayload => PublicErrorReason {
@@ -280,6 +352,22 @@ impl ProcessingError {
         }
     }
 
+    /// Determine whether the processing error should be retried.
+    ///
+    /// For `Transport` errors this defers to the transport's retry rules. For `Stage` errors it
+    /// returns the stage's `retryable` flag. `BatchPartialFailure` and all other variants are
+    /// not retryable.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the error should be retried, `false` otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let err = ProcessingError::MissingPayload;
+    /// assert!(!err.is_retryable());
+    /// ```
     pub fn is_retryable(&self) -> bool {
         match self {
             ProcessingError::Transport(e) => e.is_retryable(),

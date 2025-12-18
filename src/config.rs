@@ -17,6 +17,17 @@ pub enum LogLevel {
 impl LogLevel {}
 
 impl std::fmt::Display for LogLevel {
+    /// Formats a `LogLevel` as its lowercase textual representation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crate::LogLevel;
+    /// assert_eq!(format!("{}", LogLevel::Debug), "debug");
+    /// assert_eq!(format!("{}", LogLevel::Info), "info");
+    /// assert_eq!(format!("{}", LogLevel::Warn), "warn");
+    /// assert_eq!(format!("{}", LogLevel::Error), "error");
+    /// ```
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             LogLevel::Debug => "debug",
@@ -54,6 +65,27 @@ impl ServiceConfig {
     }
 }
 
+/// Parse a duration string expressed in seconds.
+///
+/// Accepts a string with an optional trailing `s` suffix; interprets the numeric portion as seconds.
+///
+/// # Returns
+///
+/// A `Duration` representing the parsed number of seconds.
+///
+/// # Errors
+///
+/// Returns a `ParseIntError` if the numeric portion of the input cannot be parsed as an unsigned integer.
+///
+/// # Examples
+///
+/// ```
+/// let d = parse_duration("45s").unwrap();
+/// assert_eq!(d.as_secs(), 45);
+///
+/// let d2 = parse_duration("10").unwrap();
+/// assert_eq!(d2.as_secs(), 10);
+/// ```
 fn parse_duration(s: &str) -> Result<std::time::Duration, std::num::ParseIntError> {
     if s.ends_with('s') {
         let secs: u64 = s.trim_end_matches('s').parse()?;
@@ -194,6 +226,9 @@ mod tests {
         assert!(validate_table_identifier("_temp").is_ok());
     }
 
+    /// Verifies that schema-qualified table identifiers with valid schema and table parts are accepted.
+    ///
+    /// This test asserts that identifiers like `"public.users"`, `"staging.orders"`, and `"schema_1.table_1"` pass validation.
     #[test]
     fn test_validate_table_identifier_with_schema() {
         assert!(validate_table_identifier("public.users").is_ok());
@@ -426,6 +461,17 @@ mod tests {
     }
 
     // Helper to create a valid config for validation tests
+    /// Creates a pre-filled, valid Config configured for tests.
+    ///
+    /// The returned Config is populated with sensible defaults for ServiceConfig, KafkaConfig, PostgresConfig (including a PostgresPoolConfig), and a single PipelineConfig named "test-pipeline"; it is intended to pass `Config::validate`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let cfg = create_valid_config();
+    /// assert!(cfg.validate().is_ok());
+    /// assert_eq!(cfg.pipelines.len(), 1);
+    /// ```
     fn create_valid_config() -> Config {
         Config {
             service: ServiceConfig {

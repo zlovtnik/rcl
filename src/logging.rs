@@ -18,6 +18,30 @@ impl Drop for TracingGuard {
     }
 }
 
+/// Initializes global tracing, logging, and optional OTLP exporting based on the given configuration.
+///
+/// This sets the global W3C trace context propagator, configures a logging filter (from the
+/// environment if present, otherwise from `cfg.log_level`), and installs a JSON-formatted
+/// tracing/logging layer. If `cfg.otlp_endpoint` is set, an OTLP exporter is created and attached,
+/// and the resulting tracer is shut down when the returned `TracingGuard` is dropped.
+///
+/// # Parameters
+///
+/// - `cfg`: configuration whose `log_level` determines the default logging filter and whose
+///   optional `otlp_endpoint` enables OTLP exporting when present.
+///
+/// # Returns
+///
+/// A `TracingGuard` whose `_has_otlp` field is `true` if an OTLP exporter was configured, `false` otherwise.
+///
+/// # Examples
+///
+/// ```
+/// // Construct a ServiceConfig with no OTLP endpoint (pseudo-code; adapt to your config type)
+/// let cfg = ServiceConfig { log_level: "info".into(), otlp_endpoint: None };
+/// let guard = init(&cfg).expect("failed to initialize tracing");
+/// assert!(!guard._has_otlp);
+/// ```
 pub fn init(
     cfg: &ServiceConfig,
 ) -> Result<TracingGuard, Box<dyn std::error::Error + Send + Sync + 'static>> {

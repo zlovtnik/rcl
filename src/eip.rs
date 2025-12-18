@@ -163,6 +163,19 @@ impl Pipeline {
 }
 
 impl Clone for Pipeline {
+    /// Create a new Pipeline with the same configuration and reconstructed stage instances.
+    ///
+    /// This produces a fresh Pipeline that shares the original configuration but recreates
+    /// concrete stage implementations (stages are not cloned in-place).
+    ///
+    /// Panics if rebuilding the pipeline from its stored configuration fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let cloned = pipeline.clone();
+    /// assert_eq!(cloned.config.name, pipeline.config.name);
+    /// ```
     fn clone(&self) -> Self {
         // Recreate the pipeline from config since stages can't be cloned
         Self::from_config(&self.config)
@@ -185,6 +198,16 @@ pub struct BatchingConfig {
 }
 
 impl Default for BatchingConfig {
+    /// Creates a BatchingConfig populated with the library's sensible default values.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let cfg = crate::eip::BatchingConfig::default();
+    /// assert!(!cfg.adaptive_enabled);
+    /// assert!(cfg.min_batch_size > 0);
+    /// assert!(cfg.max_batch_size >= cfg.min_batch_size);
+    /// ```
     fn default() -> Self {
         Self {
             adaptive_enabled: false,
@@ -197,15 +220,61 @@ impl Default for BatchingConfig {
 }
 
 impl BatchingConfig {
+    /// Default minimum batch size used when batching is enabled.
+    ///
+    /// This value is used as the lower bound for forming batches when adaptive batching is active.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(crate::default_min_batch_size(), 100);
+    /// ```
     fn default_min_batch_size() -> usize {
         100
     }
+    /// Default maximum batch size used when batching is enabled.
+    ///
+    /// # Returns
+    /// The maximum number of items per batch (50,000).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let max = default_max_batch_size();
+    /// assert_eq!(max, 50_000);
+    /// ```
     fn default_max_batch_size() -> usize {
         50000
     }
+    /// Default latency window size used by adaptive batching.
+    ///
+    /// This is the number of recent latency samples considered when computing adaptive batch sizes.
+    ///
+    /// # Returns
+    ///
+    /// The default latency window size (10).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let v = default_latency_window_size();
+    /// assert_eq!(v, 10);
+    /// ```
     fn default_latency_window_size() -> usize {
         10
     }
+    /// Default latency target in milliseconds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let ms = default_latency_target_ms();
+    /// assert_eq!(ms, 1000);
+    /// ```
+    ///
+    /// # Returns
+    ///
+    /// `1000` — the default latency target in milliseconds.
     fn default_latency_target_ms() -> u64 {
         1000
     }
@@ -307,6 +376,16 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Creates a StageContext populated with fixed test values for correlation id, pipeline name, and message metadata.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let ctx = create_test_context();
+    /// assert_eq!(ctx.correlation_id, "test-correlation");
+    /// assert_eq!(ctx.pipeline_name, "test-pipeline");
+    /// assert_eq!(ctx.message_metadata.topic, "test-topic");
+    /// ```
     fn create_test_context() -> StageContext {
         StageContext {
             correlation_id: "test-correlation".to_string(),
@@ -315,6 +394,17 @@ mod tests {
         }
     }
 
+    /// Creates a boxed filter stage configured to include messages whose `status` field equals `"active"`.
+    ///
+    /// The stage is configured with an "include" mode, a single equality condition on the `status` field,
+    /// and an `"AND"` logic for combining conditions.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let stage = create_filter_stage();
+    /// assert_eq!(stage.name(), "filter");
+    /// ```
     #[allow(dead_code)]
     fn create_filter_stage() -> Box<dyn Stage> {
         let stage_def = StageDefinition {
@@ -334,6 +424,14 @@ mod tests {
         StageFactory::create(&stage_def).unwrap()
     }
 
+    /// Creates a transformer stage that adds a `processed_at` field set to the current time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let stage = create_transformer_stage();
+    /// assert_eq!(stage.name(), "transformer");
+    /// ```
     #[allow(dead_code)]
     fn create_transformer_stage() -> Box<dyn Stage> {
         let stage_def = StageDefinition {
@@ -352,6 +450,17 @@ mod tests {
         StageFactory::create(&stage_def).unwrap()
     }
 
+    /// Creates a boxed router stage configured to route messages by the `category` field.
+    ///
+    /// The stage routes `"electronics"` to topic `"inventory"`, uses `"general"` as the default
+    /// route, and writes the chosen destination into the `destination` metadata field.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let stage = create_router_stage();
+    /// assert_eq!(stage.name(), "router");
+    /// ```
     #[allow(dead_code)]
     fn create_router_stage() -> Box<dyn Stage> {
         let stage_def = StageDefinition {
@@ -560,6 +669,28 @@ mod tests {
         assert_eq!(results[0].get("destination"), Some(&json!("inventory")));
     }
 
+    /// Verifies that cloning a `Pipeline` reproduces its configuration and runtime behavior.
+    ///
+    /// This test builds a pipeline with a filter and a transformer, clones it via `Clone`,
+    /// and asserts that the clone has the same configuration and produces identical outputs
+    /// (including transformed fields) when executing the same input message.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Build a pipeline config with a filter and transformer, clone the pipeline,
+    /// // and assert both pipelines produce the same results.
+    /// let config = PipelineConfig { /* ... */ };
+    /// let original = Pipeline::from_config(&config).unwrap();
+    /// let cloned = original.clone();
+    /// let ctx = create_test_context();
+    /// let msg = json!({"status": "active", "id": 123});
+    /// let r1 = original.execute(&ctx, msg.clone()).await.unwrap();
+    /// let r2 = cloned.execute(&ctx, msg).await.unwrap();
+    /// assert_eq!(r1.len(), r2.len());
+    /// assert_eq!(r1[0].get("id"), r2[0].get("id"));
+    /// assert!(r2[0].get("processed_at").is_some());
+    /// ```
     #[tokio::test]
     async fn test_pipeline_clone() {
         let filter_def = StageDefinition {
@@ -685,6 +816,25 @@ mod tests {
 
         #[async_trait]
         impl Stage for ErrorStage {
+            /// Always produces a `StageResult::Error` containing a `StageError` intended for testing.
+            ///
+            /// # Examples
+            ///
+            /// ```no_run
+            /// // Given a `stage` exposing the `process` method:
+            /// let res = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            ///     stage.process(&ctx, message).await
+            /// }).unwrap();
+            ///
+            /// match res {
+            ///     StageResult::Error(err) => assert_eq!(err.code, "TEST_ERROR"),
+            ///     _ => panic!("expected StageResult::Error"),
+            /// }
+            /// ```
+            ///
+            /// # Returns
+            ///
+            /// `StageResult::Error(StageError)` with code `TEST_ERROR` and message `"stage error for testing"`.
             async fn process(
                 &self,
                 _ctx: &StageContext,
@@ -696,6 +846,15 @@ mod tests {
                 )))
             }
 
+            /// Stage name used for metrics and logging.
+            ///
+            /// # Examples
+            ///
+            /// ```
+            /// // assuming `error_stage` implements `name() -> &str`
+            /// let stage_name = error_stage.name();
+            /// assert_eq!(stage_name, "error-stage");
+            /// ```
             fn name(&self) -> &str {
                 "error-stage"
             }
@@ -778,6 +937,19 @@ mod tests {
 
         #[async_trait]
         impl Stage for DefaultLifecycleStage {
+            /// Passes the given message to the next stage without modification.
+            ///
+            /// The input `msg` is forwarded as-is inside a `StageResult::Continue`.
+            ///
+            /// # Examples
+            ///
+            /// ```
+            /// use serde_json::json;
+            ///
+            /// // Example usage (pseudo-call):
+            /// // let result = stage.process(&ctx, json!({"key":"value"})).await?;
+            /// // assert!(matches!(result, crate::StageResult::Continue(_)));
+            /// ```
             async fn process(
                 &self,
                 _ctx: &StageContext,
@@ -786,6 +958,20 @@ mod tests {
                 Ok(StageResult::Continue(msg))
             }
 
+            /// The default stage name used for lifecycle-only stages.
+            ///
+            /// # Examples
+            ///
+            /// ```
+            /// struct S;
+            /// impl S {
+            ///     fn name(&self) -> &str { "default-lifecycle" }
+            /// }
+            /// let s = S;
+            /// assert_eq!(s.name(), "default-lifecycle");
+            /// ```
+            ///
+            /// @returns The default stage name `"default-lifecycle"`.
             fn name(&self) -> &str {
                 "default-lifecycle"
             }

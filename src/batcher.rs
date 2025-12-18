@@ -30,6 +30,21 @@ pub struct BatcherConfig {
 }
 
 impl Default for BatcherConfig {
+    /// Creates a BatcherConfig populated with sensible defaults for production use.
+    ///
+    /// The defaults enable moderate batching and a safe shutdown timeout, with adaptive
+    /// batching disabled by default and conservative adaptive bounds if later enabled.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let cfg = crate::BatcherConfig::default();
+    /// assert_eq!(cfg.flush_interval_ms, 5000);
+    /// assert_eq!(cfg.max_batch_size, 5000);
+    /// assert_eq!(cfg.max_batch_bytes, 10_485_760);
+    /// assert_eq!(cfg.shutdown_timeout.as_secs(), 30);
+    /// assert_eq!(cfg.adaptive_batch_enabled, false);
+    /// ```
     fn default() -> Self {
         Self {
             flush_interval_ms: 5000,     // 5 seconds
@@ -46,6 +61,26 @@ impl Default for BatcherConfig {
 }
 
 impl BatcherConfig {
+    /// Creates a BatcherConfig from pipeline and Postgres settings using the provided shutdown timeout.
+    ///
+    /// The resulting config uses:
+    /// - `flush_interval_ms` = 5000 ms,
+    /// - `max_batch_size` from `postgres.copy_batch_rows`,
+    /// - `max_batch_bytes` = 10_485_760 bytes,
+    /// and maps adaptive batching fields from `pipeline.batching` (`adaptive_enabled`, `min_batch_size`,
+    /// `max_batch_size`, `latency_window_size`, `latency_target_ms`). The provided `shutdown_timeout` is used
+    /// verbatim.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// let pipeline: PipelineConfig = Default::default();
+    /// let postgres: PostgresConfig = Default::default();
+    /// let cfg = BatcherConfig::from_pipeline_config(&pipeline, &postgres, Duration::from_secs(30));
+    /// assert_eq!(cfg.shutdown_timeout, Duration::from_secs(30));
+    /// ```
     pub fn from_pipeline_config(
         pipeline: &PipelineConfig,
         postgres: &PostgresConfig,
@@ -77,6 +112,20 @@ pub struct PipelineBuffer {
 }
 
 impl PipelineBuffer {
+    /// Creates a new, empty `PipelineBuffer` for the specified pipeline and table.
+    ///
+    /// The buffer is initialized with no messages or contexts, zero byte count,
+    /// `last_flush` set to the current instant, and `first_message_time` unset.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let buf = PipelineBuffer::new("my_pipeline".to_string(), "my_table".to_string());
+    /// assert!(buf.is_empty());
+    /// assert_eq!(buf.len(), 0);
+    /// assert_eq!(buf.pipeline_name, "my_pipeline");
+    /// assert_eq!(buf.table, "my_table");
+    /// ```
     pub fn new(pipeline_name: String, table: String) -> Self {
         Self {
             messages: Vec::new(),
@@ -89,6 +138,28 @@ impl PipelineBuffer {
         }
     }
 
+    /// Adds a JSON `message` and its `context` to this buffer if the resulting batch size stays within `max_batch_bytes`.
+    ///
+    /// The optional `message_size` can be provided to avoid serializing `message`; if omitted, the function serializes the message to determine its size. The method returns an error if serialization fails or if adding the message would exceed `max_batch_bytes`.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the message and context were appended; `Err(ProcessingError::Validation)` if serialization fails or the message would exceed the batch byte limit.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use serde_json::json;
+    ///
+    /// let mut buf = PipelineBuffer::new("pipeline", "table");
+    /// let msg = json!({ "id": 1, "name": "example" });
+    /// // Provide a precomputed size to avoid serialization in this example.
+    /// let precomputed_size = serde_json::to_string(&msg).unwrap().len();
+    /// let ctx = MessageContext::default();
+    ///
+    /// buf.add_message(msg, ctx, 10_000, Some(precomputed_size)).unwrap();
+    /// assert_eq!(buf.len(), 1);
+    /// ```
     pub fn add_message(
         &mut self,
         message: Value,
@@ -145,6 +216,19 @@ impl PipelineBuffer {
         None
     }
 
+    /// Empties the buffer and resets its byte and timing state.
+    ///
+    /// This removes all stored messages and their corresponding contexts, sets `current_bytes` to 0,
+    /// updates `last_flush` to the current instant, and clears `first_message_time`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut buf = PipelineBuffer::new("pipeline", "table");
+    /// buf.clear();
+    /// assert!(buf.is_empty());
+    /// assert_eq!(buf.len(), 0);
+    /// ```
     pub fn clear(&mut self) {
         self.messages.clear();
         self.contexts.clear();
@@ -153,10 +237,33 @@ impl PipelineBuffer {
         self.first_message_time = None;
     }
 
+    /// Checks whether the buffer contains no messages.
+    ///
+    /// # Returns
+    /// `true` if the buffer contains no messages, `false` otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let buf = PipelineBuffer::new("pipeline_name", "table_name");
+    /// assert!(buf.is_empty());
+    /// ```
     pub fn is_empty(&self) -> bool {
         self.messages.is_empty()
     }
 
+    /// Retrieve the number of messages currently stored in the buffer.
+    ///
+    /// # Returns
+    ///
+    /// The number of messages in the buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let buf = PipelineBuffer::new("pipeline", "table");
+    /// assert_eq!(buf.len(), 0);
+    /// ```
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.messages.len()
@@ -193,6 +300,25 @@ pub struct Batcher {
 }
 
 impl Batcher {
+    /// Creates a new Batcher wired to the provided writer, metrics, shutdown coordinator, and committed-offsets sender.
+    ///
+    /// The returned Batcher is ready to accept messages and will listen for shutdown signals from the coordinator.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use tokio::sync::mpsc;
+    /// // Assume BatcherConfig, Writer, Metrics, ShutdownCoordinator are available in scope.
+    ///
+    /// let config = BatcherConfig::default();
+    /// let writer = Arc::new(/* your Writer implementation */);
+    /// let metrics = Metrics::default();
+    /// let shutdown_coordinator = ShutdownCoordinator::new();
+    /// let (tx, _rx) = mpsc::unbounded_channel::<std::collections::HashMap<(String, i32), i64>>();
+    ///
+    /// let batcher = crate::batcher::Batcher::new(config, writer, metrics, &shutdown_coordinator, tx);
+    /// ```
     pub fn new(
         config: BatcherConfig,
         writer: Arc<Writer>,
@@ -211,6 +337,28 @@ impl Batcher {
         }
     }
 
+    /// Appends a message and its context to the pipeline/table buffer and triggers an immediate flush if thresholds are met.
+    ///
+    /// The message is enqueued into the in-memory buffer for the given pipeline and table, the message counter metric is incremented, and the buffer will be flushed immediately if adding this message causes a size, byte, or time threshold to be exceeded.
+    ///
+    /// # Parameters
+    ///
+    /// - `pipeline_name`: Identifier of the source pipeline for the message.
+    /// - `table`: Target table name where the message will be written.
+    /// - `message`: JSON payload to buffer.
+    /// - `context`: Per-message context (e.g., topic/partition/offset) preserved for eventual offset commitment.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` on success; `Err(ProcessingError)` if the message cannot be enqueued or processing fails (for example, JSON serialization or validation errors).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn doc_example(mut batcher: crate::batcher::Batcher, msg: serde_json::Value, ctx: crate::batcher::MessageContext) {
+    /// batcher.add_message("my_pipeline", "users", msg, ctx).await.unwrap();
+    /// # }
+    /// ```
     pub async fn add_message(
         &mut self,
         pipeline_name: &str,
@@ -259,6 +407,23 @@ impl Batcher {
         Ok(())
     }
 
+    /// Flushes a non-empty PipelineBuffer by attempting a batched write and falling back to individual writes.
+    ///
+    /// On success, committed offsets for successfully written messages are sent and, if adaptive batching is
+    /// enabled, the batch size may be adjusted based on observed latency. If the batch write fails but some
+    /// individual message writes succeed, offsets for those messages are sent and the function returns `Ok(())`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // assume `batcher` is a mutable Batcher instance and `buffer` is a PipelineBuffer populated with messages
+    /// // batcher.flush_buffer(&mut buffer, FlushReason::Time).await.unwrap();
+    /// ```
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if at least one message in the buffer was written successfully, `Err(ProcessingError)` if the
+    /// batch write failed and all individual message writes also failed.
     async fn flush_buffer(
         &mut self,
         buffer: &mut PipelineBuffer,
@@ -373,6 +538,29 @@ impl Batcher {
         }
     }
 
+    /// Sends committed offsets derived from a slice of message contexts.
+    ///
+    /// Builds a map from `(topic, partition)` to the next offset to commit (each
+    /// context's `offset + 1`), taking the maximum next-offset for any duplicate
+    /// `(topic, partition)` keys, and sends that map over the `committed_offsets_tx`
+    /// channel. If the `contexts` slice is empty this is a no-op. If sending fails,
+    /// an error is logged.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Prepare contexts for two partitions (one duplicate with higher offset)
+    /// let contexts = vec![
+    ///     MessageContext { topic: "t".into(), partition: 0, offset: 4, ..Default::default() },
+    ///     MessageContext { topic: "t".into(), partition: 0, offset: 6, ..Default::default() },
+    ///     MessageContext { topic: "t".into(), partition: 1, offset: 2, ..Default::default() },
+    /// ];
+    ///
+    /// // Send committed offsets for these contexts:
+    /// // ( "t", 0 ) -> 7  (max of 4+1 and 6+1)
+    /// // ( "t", 1 ) -> 3
+    /// batcher.send_committed_offsets(&contexts);
+    /// ```
     fn send_committed_offsets(&self, contexts: &[MessageContext]) {
         if contexts.is_empty() {
             return;
@@ -392,6 +580,25 @@ impl Batcher {
         }
     }
 
+    /// Adjusts the configured maximum batch size based on recent batch latency samples.
+    ///
+    /// Uses a sliding window of recent latencies to compute an average. If the average latency
+    /// is greater than the configured latency target, the batch size is reduced (but not by
+    /// more than 50% in one adjustment). If the average latency is below the target, the batch
+    /// size may be increased (but not more than 2x in one adjustment). The resulting batch size
+    /// is clamped between `adaptive_min_batch_size` and `adaptive_max_batch_size`. When the
+    /// configured size changes, the new value is written to `self.config.max_batch_size` and
+    /// the `current_batch_size_limit` metric is updated.
+    ///
+    /// `latency` should be the observed time between the first message arrival and the batch flush.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Assume `batcher` is a mutable Batcher instance configured for adaptive sizing.
+    /// // Provide the most recent observed latency to let the batcher update its limits.
+    /// batcher.adjust_batch_size(std::time::Duration::from_millis(150));
+    /// ```
     fn adjust_batch_size(&mut self, latency: Duration) {
         let latency_ms = latency.as_millis() as f64;
 
@@ -439,6 +646,22 @@ impl Batcher {
         }
     }
 
+    /// Runs a background loop that periodically flushes pending buffers and exits when a shutdown signal is received.
+    ///
+    /// The loop wakes once per second to call `flush_pending_buffers`. When a shutdown signal is received it flushes
+    /// all buffers with `FlushReason::Shutdown` and then returns.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the loop exits after a successful shutdown flush, `Err(ProcessingError)` if a flush operation fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // Spawned in a task; the batcher will flush periodically and exit once a shutdown signal is sent.
+    /// // let mut batcher = /* create batcher */ ;
+    /// // tokio::spawn(async move { let _ = batcher.run_background_flush().await; });
+    /// ```
     pub async fn run_background_flush(&mut self) -> Result<(), ProcessingError> {
         let mut interval = time::interval(Duration::from_millis(1000)); // Check every second
 
@@ -497,6 +720,20 @@ impl Batcher {
 mod tests {
     use super::*;
 
+    /// Creates a BatcherConfig preconfigured for tests.
+    ///
+    /// The configuration uses a short flush interval and small batch limits to make
+    /// flush and size-based behaviors deterministic in unit tests. Adaptive batching
+    /// is disabled by default in this test config.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let cfg = create_test_config();
+    /// assert_eq!(cfg.max_batch_size, 3);
+    /// assert!(!cfg.adaptive_batch_enabled);
+    /// assert_eq!(cfg.flush_interval_ms, 100);
+    /// ```
     fn create_test_config() -> BatcherConfig {
         BatcherConfig {
             flush_interval_ms: 100, // Short for testing
@@ -511,6 +748,16 @@ mod tests {
         }
     }
 
+    /// Creates a JSON test message with the given `id` for use in tests.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let v = create_test_message(42);
+    /// assert_eq!(v["id"], 42);
+    /// assert_eq!(v["data"], "test data");
+    /// assert_eq!(v["operation_type"], "c");
+    /// ```
     fn create_test_message(id: u32) -> Value {
         serde_json::json!({
             "id": id,
@@ -519,6 +766,17 @@ mod tests {
         })
     }
 
+    /// Creates a MessageContext used in tests with the provided offset.
+    ///
+    /// The returned context has topic `"test-topic"`, partition `0`, timestamp `1000`, and the given offset.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let ctx = create_test_context(42);
+    /// assert_eq!(ctx.offset, 42);
+    /// assert_eq!(ctx.topic, "test-topic");
+    /// ```
     fn create_test_context(offset: i64) -> MessageContext {
         MessageContext {
             topic: "test-topic".to_string(),

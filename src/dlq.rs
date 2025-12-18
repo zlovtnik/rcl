@@ -312,6 +312,22 @@ pub async fn drain(
     Ok(())
 }
 
+/// Prints up to `limit` messages from the configured DLQ `topic`.
+///
+/// Subscribes a temporary consumer, waits for Kafka readiness, then receives and prints each message's UTF-8 payload or a notice when the payload is invalid UTF-8. The operation stops after `limit` messages, on a receive error, or on a receive timeout.
+///
+/// `cfg` is the Kafka configuration, `topic` is the DLQ topic name to inspect, and `limit` is the maximum number of messages to print.
+///
+/// # Examples
+///
+/// ```no_run
+/// // Inspect up to 10 messages from the "my-dlq" topic.
+/// // Requires an async runtime (tokio) and a valid KafkaConfig.
+/// # async fn example(cfg: &crate::kafka::KafkaConfig) -> anyhow::Result<()> {
+/// crate::dlq::inspect(cfg, "my-dlq", 10).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub async fn inspect(cfg: &KafkaConfig, topic: &str, limit: usize) -> Result<()> {
     let consumer = build_dlq_consumer(cfg, format!("rcl-dlq-inspector-{}", uuid::Uuid::new_v4()))?;
 
