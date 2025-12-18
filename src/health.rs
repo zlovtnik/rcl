@@ -131,8 +131,13 @@ impl HealthRegistry {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let mut status = ComponentStatus::Healthy;
-        if kafka == ComponentStatus::Unhealthy || postgres == ComponentStatus::Unhealthy {
+        let mut all_statuses = vec![kafka.clone(), postgres.clone()];
+
+        // First pass: check for Unhealthy
+        if all_statuses.iter().any(|s| s == &ComponentStatus::Unhealthy) {
             status = ComponentStatus::Unhealthy;
+        } else if all_statuses.iter().any(|s| s == &ComponentStatus::Degraded) {
+            status = ComponentStatus::Degraded;
         }
 
         let mut pipelines = HashMap::with_capacity(pipelines_guard.len());
@@ -150,10 +155,15 @@ impl HealthRegistry {
                 p_health.last_error = Some("Pipeline stalled".to_string());
             }
 
-            if p_health.status != ComponentStatus::Healthy && status == ComponentStatus::Healthy {
-                status = ComponentStatus::Degraded;
-            }
+            all_statuses.push(p_health.status.clone());
             pipelines.insert(name.clone(), p_health);
+        }
+
+        // Second pass: update status based on worst case including pipelines
+        if all_statuses.iter().any(|s| s == &ComponentStatus::Unhealthy) {
+            status = ComponentStatus::Unhealthy;
+        } else if all_statuses.iter().any(|s| s == &ComponentStatus::Degraded) {
+            status = ComponentStatus::Degraded;
         }
 
         SystemHealth {

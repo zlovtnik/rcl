@@ -1,0 +1,46 @@
+{
+  "service": {
+    "log_level": "info",
+    "metrics_port": 9090,
+    "health_check_timeout_ms": 5000,
+    "shutdown_timeout": "30s"
+  },
+  "kafka": {
+    "brokers": "localhost:9092",
+    "group_id": "rcl-consumer-group",
+    "session_timeout_ms": 45000,
+    "max_inflight_messages": 500,
+    "producer_retries": 5,
+    "dlq_message_timeout_ms": 15000,
+    "compression": "none",
+    "staleness_threshold_seconds": 300
+  },
+  "postgres": {
+    "url": "postgresql://rcl:rcl@localhost:5432/warehouse",
+    "copy_enabled": true,
+    "copy_batch_rows": 5000,
+    "insert_batch_rows": 500,
+    "pool": {
+      "max_connections": 10,
+      "acquire_timeout_ms": 5000
+    }
+  },
+  "pipelines": [
+    {
+      "name": "example_pipeline",
+      "topic": "cdc.example",
+      "debezium_envelope": true,
+      "staging_table": "staging_example",
+      "required_fields": ["id"],
+      "backpressure": {
+        "channel_capacity": 20000
+      },
+      "dlq": {
+        "topic": "dlq.example",
+        "max_retries": 3,
+        "max_payload_bytes": 1048576
+      },
+      "stages": []
+    }
+  ]
+}

@@ -513,7 +513,7 @@ If you need to prioritize, start with these high-impact, low-effort items:
 
 1. **Graceful shutdown** (4h) - Prevents data loss
 2. **Health check endpoints** (3h) - Enables proper deployment
-3. **Message batching** (12h total) - Massive throughput improvement
+3. **Message batching** (12h total: Phase 2.1 + 2.2) - Massive throughput improvement
 4. **Enhanced metrics** (5h) - Visibility into what's happening
 5. **Retry logic** (6h) - Resilience against transient failures
 

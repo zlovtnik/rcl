@@ -1,10 +1,16 @@
 use crate::config::Config;
 use anyhow::Result;
+use chrono::Utc;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use std::time::{Duration, Instant};
 use tokio::time;
+use tokio::time::MissedTickBehavior;
 
 pub async fn run(cfg: Config, rate: u32, duration_sec: u64) -> Result<()> {
+    if rate == 0 {
+        return Err(anyhow::anyhow!("rate must be > 0"));
+    }
+
     let producer: FutureProducer = rdkafka::config::ClientConfig::new()
         .set("bootstrap.servers", &cfg.kafka.brokers)
         .set("message.timeout.ms", "5000")
@@ -24,6 +30,7 @@ pub async fn run(cfg: Config, rate: u32, duration_sec: u64) -> Result<()> {
     let start = Instant::now();
     let interval = Duration::from_micros(1_000_000 / rate as u64);
     let mut interval_timer = time::interval(interval);
+    interval_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut count = 0;
 
     while start.elapsed().as_secs() < duration_sec {

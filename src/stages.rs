@@ -1,10 +1,12 @@
 use crate::eip::{Stage, StageContext, StageError, StageResult};
-use crate::errors::ProcessingError;
+use crate::errors::{ProcessingError, ValidationError};
 use anyhow::Result;
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::time::Duration;
+use redis::aio::MultiplexedConnection;
 
 /// Filter Stage - Skip messages that don't match criteria
 pub struct FilterStage {
@@ -409,7 +411,7 @@ impl ValueGenerator {
                             format!("Time error: {}", e),
                         ))
                     })?
-                    .as_millis() as i64;
+                    .as_secs() as i64;
                 Ok(Value::Number(serde_json::Number::from(now)))
             }
         }
@@ -721,6 +723,141 @@ fn merge_objects(mut base: Value, other: Value) -> Value {
     base
 }
 
+/// Idempotent Receiver Stage - Detect and skip duplicate messages
+#[derive(Clone, Debug)]
+enum FallbackMode {
+    Pass,
+    Fail,
+}
+
+#[async_trait]
+trait DeduplicationStorage: Send + Sync {
+    async fn check_and_set(&self, key: &str, ttl: Duration) -> Result<bool>;
+}
+
+struct RedisStorage {
+    client: MultiplexedConnection,
+}
+
+#[async_trait]
+impl DeduplicationStorage for RedisStorage {
+    async fn check_and_set(&self, key: &str, ttl: Duration) -> Result<bool> {
+        let mut conn = self.client.clone();
+        let result: Option<String> = redis::cmd("SET")
+            .arg(key)
+            .arg("1")
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl.as_secs())
+            .query_async(&mut conn)
+            .await?;
+        Ok(result.is_some())
+    }
+}
+
+pub struct IdempotentReceiverStage {
+    name: String,
+    key_field: String,
+    storage: Box<dyn DeduplicationStorage>,
+    ttl: Duration,
+    fallback: FallbackMode,
+}
+
+impl IdempotentReceiverStage {
+    pub fn from_config(name: String, config: Value) -> Result<Self> {
+        let key_field = config
+            .get("key_field")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("key_field is required"))?
+            .to_string();
+
+        let ttl_seconds = config
+            .get("ttl_seconds")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(86400);
+
+        let ttl = Duration::from_secs(ttl_seconds);
+
+        let storage_type = config
+            .get("storage")
+            .and_then(|v| v.as_str())
+            .unwrap_or("redis");
+
+        let storage: Box<dyn DeduplicationStorage> = match storage_type {
+            "redis" => {
+                let redis_url = config
+                    .get("redis_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("redis://localhost:6379");
+                let client = redis::Client::open(redis_url)?;
+                let conn = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        client.get_multiplexed_async_connection().await
+                    })
+                })?;
+                Box::new(RedisStorage { client: conn })
+            }
+            _ => return Err(anyhow::anyhow!("unsupported storage type: {}", storage_type)),
+        };
+
+        let fallback = match config
+            .get("fallback_on_error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pass")
+        {
+            "pass" => FallbackMode::Pass,
+            "fail" => FallbackMode::Fail,
+            _ => FallbackMode::Pass,
+        };
+
+        Ok(Self {
+            name,
+            key_field,
+            storage,
+            ttl,
+            fallback,
+        })
+    }
+}
+
+#[async_trait]
+impl Stage for IdempotentReceiverStage {
+    async fn process(&self, _ctx: &StageContext, msg: Value) -> Result<StageResult, ProcessingError> {
+        let key = if let Some(Value::String(field_value)) = msg.get(&self.key_field) {
+            field_value.clone()
+        } else {
+            return Err(ProcessingError::Validation(ValidationError::new(format!(
+                "key field '{}' not found or not a string",
+                self.key_field
+            ))));
+        };
+
+        match self.storage.check_and_set(&key, self.ttl).await {
+            Ok(is_new) => {
+                if is_new {
+                    Ok(StageResult::Continue(msg))
+                } else {
+                    Ok(StageResult::Skip)
+                }
+            }
+            Err(e) => match self.fallback {
+                FallbackMode::Pass => {
+                    tracing::warn!("deduplication check failed, passing message: {}", e);
+                    Ok(StageResult::Continue(msg))
+                }
+                FallbackMode::Fail => Err(ProcessingError::Stage(StageError::new(
+                    "deduplication check failed",
+                    &format!("{}", e),
+                ))),
+            },
+        }
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,7 +892,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_filter_stage_exclude() {
+    async fn test_filter_stage_include_skip() {
         let stage = FilterStage {
             name: "test".to_string(),
             mode: FilterMode::Include,

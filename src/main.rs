@@ -1,3 +1,4 @@
+mod batcher;
 mod config;
 mod consumer;
 mod decoder;
@@ -81,6 +82,7 @@ enum DlqAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
     let cli = Cli::parse();
     let cfg = Config::from_env()?;
 

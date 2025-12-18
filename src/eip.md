@@ -725,7 +725,13 @@ impl Transformation {
                 }
             }
             Transformation::Script { engine, code } => {
-                engine.execute(msg, code)?;
+                let mut context = ScriptContext {
+                    message: msg.clone(),
+                    stage_context: ctx.clone(),
+                    variables: HashMap::new(),
+                    host_functions: self.host_functions.clone(),
+                };
+                *msg = engine.execute(&mut context, code).await?;
             }
         }
         Ok(())
@@ -885,7 +891,7 @@ use std::time::Duration;
 
 #[async_trait]
 pub trait ScriptEngine: Send + Sync {
-    /// Execute a script synchronously with the provided context
+    /// Execute a script with the provided context
     async fn execute(
         &self,
         context: &mut ScriptContext,
@@ -1012,6 +1018,8 @@ Capability-based security with explicit allowlisting:
 - **JavaScript**: Via `quickjs` or `deno_core` - modern syntax, extensive libraries
 - Language selection configured per transformation
 
+> **Security Note**: Only Rhai is covered by the full security review described in sections 991–1000. Lua (`rlua`) and JavaScript (`quickjs`/`deno_core`) have different sandboxing characteristics and require separate security audits before production use. Host-function and resource access (filesystem, network, timers, etc.) must be explicitly controlled and documented per-language. See follow-up audit and configuration guidance for implementation details.
+
 #### Rhai Integration Pattern
 
 Complete implementation example for Rhai engine integration:
@@ -1110,7 +1118,6 @@ impl RhaiScriptEngine {
 
         Ok(())
     }
-}
 
 #[async_trait]
 impl ScriptEngine for RhaiScriptEngine {
@@ -1138,9 +1145,12 @@ impl ScriptEngine for RhaiScriptEngine {
         let engine = self.engine.clone();
         let code = code.to_string();
 
-        let result = timeout(self.timeout, async move {
-            engine.eval_with_scope::<Dynamic>(&mut scope, &code)
-        }).await
+        let result = timeout(
+            self.timeout,
+            tokio::task::spawn_blocking(move || {
+                engine.eval_with_scope::<Dynamic>(&mut scope, &code)
+            })
+        ).await
             .map_err(|_| EngineError::Timeout { duration: self.timeout })?
             .map_err(|e| EngineError::Runtime { message: e.to_string() })?;
 

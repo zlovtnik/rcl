@@ -1,3 +1,4 @@
+use crate::batcher::{Batcher, BatcherConfig};
 use crate::config::{Config, KafkaConfig};
 use crate::decoder::decode_and_validate;
 use crate::dlq;
@@ -5,12 +6,14 @@ use crate::eip::{MessageMetadata, Pipeline, StageContext};
 use crate::errors::{ProcessingError, ValidationError};
 use crate::health::{ComponentStatus, HealthRegistry};
 use crate::metrics::Metrics;
+use crate::shutdown::ShutdownCoordinator;
 use crate::types::MessageContext;
 use crate::writer::Writer;
 use anyhow::Result;
 use futures::StreamExt;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::OwnedMessage;
+use serde_json::Value;
 use rdkafka::producer::FutureProducer;
 use rdkafka::Message;
 use std::collections::HashMap;
@@ -27,11 +30,23 @@ use rdkafka::TopicPartitionList;
 
 struct ConsumerContext {
     consumer: Arc<StreamConsumer>,
-    writer: Arc<Writer>,
+    batcher: Arc<tokio::sync::Mutex<Batcher>>,
     metrics: Metrics,
     health: Arc<HealthRegistry>,
     pipelines_by_topic: HashMap<String, Pipeline>,
     producer: Option<FutureProducer>,
+}
+
+impl ConsumerContext {
+    async fn add_to_batcher(
+        &self,
+        pipeline_name: &str,
+        table: &str,
+        message: Value,
+    ) -> Result<(), ProcessingError> {
+        let mut batcher = self.batcher.lock().await;
+        batcher.add_message(pipeline_name, table, message).await
+    }
 }
 
 async fn handle_decode_error(
@@ -90,7 +105,7 @@ impl ConsumerContext {
 
         let processed_messages = pipeline.execute(&stage_ctx, decoded).await?;
 
-        // Write processed messages
+        // Batch processed messages
         for msg in processed_messages {
             // Check for routing metadata
             let candidate = msg
@@ -101,7 +116,7 @@ impl ConsumerContext {
             let table = crate::config::validate_table_identifier(candidate)
                 .map_err(|e| ProcessingError::Validation(ValidationError::new(e.to_string())))?;
 
-            self.writer.write(&msg, table, &pipeline.name).await?;
+            self.add_to_batcher(&pipeline.name, table, msg.clone()).await?;
         }
 
         Ok(())
@@ -380,9 +395,15 @@ pub async fn replay(
         topic, partition, start_offset, end_offset
     );
 
+    // For replay, we'll use the writer directly since batching isn't needed
     let context = ConsumerContext {
         consumer: Arc::new(consumer),
-        writer,
+        batcher: Arc::new(tokio::sync::Mutex::new(Batcher::new(
+            BatcherConfig::default(),
+            writer.clone(),
+            _metrics.clone(),
+            &ShutdownCoordinator::default(),
+        ))), // Not used in replay
         metrics: _metrics,
         health: Arc::new(HealthRegistry::new(Duration::from_secs(30))), // Not used in replay
         pipelines_by_topic,
@@ -461,6 +482,7 @@ pub async fn run(
 
     let shutdown_rx_heartbeat = shutdown_rx.resubscribe();
     let shutdown_rx_fetch = shutdown_rx.resubscribe();
+    let _shutdown_rx_batcher = shutdown_rx.resubscribe();
 
     let capacity = cfg
         .pipelines
@@ -491,11 +513,25 @@ pub async fn run(
         None
     };
 
+    // Create batcher
+    let shutdown_coordinator = ShutdownCoordinator::default();
+    let batcher_config = BatcherConfig::from_pipeline_config(
+        &cfg.pipelines[0], // Use first pipeline for config, could be made per-pipeline later
+        &cfg.postgres,
+        cfg.service.shutdown_timeout_duration(),
+    );
+    let batcher = Arc::new(tokio::sync::Mutex::new(Batcher::new(
+        batcher_config,
+        writer.clone(),
+        metrics.clone(),
+        &shutdown_coordinator,
+    )));
+
     let (tx, rx) = mpsc::channel::<(MessageContext, OwnedMessage)>(capacity);
 
     let context = ConsumerContext {
         consumer: consumer.clone(),
-        writer,
+        batcher: batcher.clone(),
         metrics: metrics.clone(),
         health: health.clone(),
         pipelines_by_topic,
@@ -521,7 +557,15 @@ pub async fn run(
 
     let processing_loop = tokio::spawn(run_processing_loop(rx, context, consumer));
 
-    tokio::try_join!(fetch_loop, processing_loop, heartbeat_task)?;
+    // Spawn batcher background flush task
+    let batcher_task = tokio::spawn(async move {
+        let mut batcher_guard = batcher.lock().await;
+        if let Err(e) = batcher_guard.run_background_flush().await {
+            error!("batcher background flush failed: {}", e);
+        }
+    });
+
+    tokio::try_join!(fetch_loop, processing_loop, heartbeat_task, batcher_task)?;
     info!("consumer loops stopped");
     Ok(())
 }

@@ -45,7 +45,7 @@ Access Prometheus metrics at `http://localhost:9090/metrics`.
 ## Production Readiness Checklist
 
 - [ ] **Security**: TLS enabled for Kafka and Postgres. Secrets loaded from env vars.
-- [ ] **Observability**: Prometheus scraping configured. Alerts set for `rcl_lag_ms` > 10s and `rcl_processing_failures` > 0.
+- [ ] **Observability**: Prometheus scraping configured. Alerts set for `rcl_lag_ms > 10000` and `rcl_processing_failures > 0`.
 - [ ] **Reliability**: DLQ topic exists and is monitored.
 - [ ] **Database**: Staging tables created with required metadata columns (see [sql/staging_tables.sql](sql/staging_tables.sql)):
   - `_meta_topic TEXT` (nullable) - Kafka source topic name

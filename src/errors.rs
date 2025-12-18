@@ -80,6 +80,10 @@ pub enum TransportSource {
     Sqlx(#[from] SqlxError),
     #[error(transparent)]
     Json(#[from] JsonError),
+    #[error(transparent)]
+    Csv(#[from] csv::Error),
+    #[error("utf8 error: {0}")]
+    Utf8(#[from] std::string::FromUtf8Error),
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -107,6 +111,8 @@ impl TransportSource {
                 SqlxError::Database(db_err) => is_transient_db_error(&**db_err),
                 _ => false,
             },
+            TransportSource::Csv(_) => false,
+            TransportSource::Utf8(_) => false,
         }
     }
 }

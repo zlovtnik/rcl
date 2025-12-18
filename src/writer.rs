@@ -6,6 +6,7 @@ use crate::types::Operation;
 use backoff::future::retry;
 use backoff::ExponentialBackoff;
 use chrono::Utc;
+use csv::Writer as CsvWriter;
 
 use serde_json::Value;
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions, PgSslMode};
@@ -222,7 +223,7 @@ impl Writer {
                 {
                     warn!("Failed to update pipeline error status: {}", err);
                 }
-                if e.is_retryable() {
+                if !e.is_retryable() {
                     let _ = self.health.set_postgres_status(ComponentStatus::Unhealthy);
                 }
             }
@@ -258,15 +259,22 @@ async fn copy_into(
         let json = serde_json::to_string(&meta.payload)
             .map_err(|e| ProcessingError::from(TransportError::new("json encode", e)))?;
         let escaped_json = json.replace('"', "\"\"");
-        let line = format!(
-            "\"{}\",{},\"{}\",{},{},{}\n",
-            escaped_json,
-            Utc::now(),
-            meta.topic,
-            meta.partition,
-            meta.offset,
-            meta.ingest_ts
-        );
+        let mut wtr = CsvWriter::from_writer(vec![]);
+        wtr.write_record(&[
+            &escaped_json,
+            &Utc::now().timestamp_millis().to_string(),
+            &meta.topic,
+            &meta.partition.to_string(),
+            &meta.offset.to_string(),
+            &meta.ingest_ts.to_string(),
+        ])
+        .map_err(|e| ProcessingError::Validation(ValidationError::new(format!("csv write: {}", e))))?;
+        let csv_data = wtr
+            .into_inner()
+            .map_err(|e| ProcessingError::Validation(ValidationError::new(format!("csv flush: {}", e))))?;
+        let line = String::from_utf8(csv_data)
+            .map_err(|e| ProcessingError::Validation(ValidationError::new(format!("utf8 decode: {}", e))))?
+            + "\n";
         writer
             .send(line.into_bytes())
             .await

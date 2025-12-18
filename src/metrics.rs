@@ -2,7 +2,7 @@ use crate::health::{ComponentStatus, HealthRegistry};
 use anyhow::Result;
 use axum::{routing::get, Router};
 use prometheus::{
-    Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, IntGaugeVec, Opts, Registry,
+    Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
     TextEncoder,
 };
 use std::net::SocketAddr;
@@ -21,6 +21,11 @@ pub struct Metrics {
     pub write_latency_seconds: Histogram,
     pub batch_size: Histogram,
     pub last_poll_timestamp: IntGauge,
+    // Batch-specific metrics
+    pub batch_messages_total: IntCounter,
+    pub batch_flush_total: IntCounterVec,
+    pub batch_bytes_total: IntCounter,
+    pub batch_latency_seconds: Histogram,
 }
 
 impl Metrics {
@@ -52,6 +57,24 @@ impl Metrics {
             "Timestamp of last successful poll in milliseconds since epoch",
         ))?;
 
+        // Batch-specific metrics
+        let batch_messages_total = IntCounter::with_opts(Opts::new(
+            "batch_messages_total",
+            "Total messages processed through batcher",
+        ))?;
+        let batch_flush_total = IntCounterVec::new(
+            Opts::new("batch_flush_total", "Total batch flushes by reason"),
+            &["reason"],
+        )?;
+        let batch_bytes_total = IntCounter::with_opts(Opts::new(
+            "batch_bytes_total",
+            "Total bytes processed through batcher",
+        ))?;
+        let batch_latency_seconds = Histogram::with_opts(HistogramOpts::new(
+            "batch_latency_seconds",
+            "Time from first message to batch flush",
+        ))?;
+
         // Register all metrics directly - they're already created above
         registry.register(Box::new(messages_total.clone()))?;
         registry.register(Box::new(decode_failures.clone()))?;
@@ -61,6 +84,10 @@ impl Metrics {
         registry.register(Box::new(write_latency_seconds.clone()))?;
         registry.register(Box::new(batch_size.clone()))?;
         registry.register(Box::new(last_poll_timestamp.clone()))?;
+        registry.register(Box::new(batch_messages_total.clone()))?;
+        registry.register(Box::new(batch_flush_total.clone()))?;
+        registry.register(Box::new(batch_bytes_total.clone()))?;
+        registry.register(Box::new(batch_latency_seconds.clone()))?;
 
         Ok(Self {
             messages_total,
@@ -71,6 +98,10 @@ impl Metrics {
             write_latency_seconds,
             batch_size,
             last_poll_timestamp,
+            batch_messages_total,
+            batch_flush_total,
+            batch_bytes_total,
+            batch_latency_seconds,
         })
     }
 }

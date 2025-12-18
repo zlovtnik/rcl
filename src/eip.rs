@@ -1,5 +1,5 @@
 use crate::errors::ProcessingError;
-use crate::stages::{FilterStage, RouterStage, SplitterStage, TransformerStage};
+use crate::stages::{FilterStage, RouterStage, SplitterStage, TransformerStage, IdempotentReceiverStage};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -245,6 +245,10 @@ impl StageFactory {
                 def.config.clone(),
             )?)),
             "splitter" => Ok(Box::new(SplitterStage::from_config(
+                def.name.clone(),
+                def.config.clone(),
+            )?)),
+            "idempotent_receiver" => Ok(Box::new(IdempotentReceiverStage::from_config(
                 def.name.clone(),
                 def.config.clone(),
             )?)),
