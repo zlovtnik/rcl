@@ -32,6 +32,7 @@ The stack includes the following services:
 - Docker Compose 2.0+
 - At least 8GB RAM available
 - 20GB free disk space
+- GNU coreutils (for `timeout` command on macOS/Linux; install with `brew install coreutils` on macOS)
 
 ### 1. Clone and Setup
 ```bash
@@ -171,6 +172,38 @@ docker run --rm -v middleware_postgres_data:/data -v $(pwd):/backup alpine tar x
 4. **Set resource limits** appropriately
 5. **Enable authentication** on all services
 6. **Regular security updates** of Docker images
+
+### Required Environment Variables for Production
+
+For secure production deployments, set these environment variables before importing Keycloak realm configuration:
+
+```bash
+# Keycloak Client Secrets (generate strong random values)
+KEYCLOAK_MIDDLEWARE_APP_SECRET=your-secure-middleware-app-secret-here
+KEYCLOAK_GRAFANA_SECRET=your-secure-grafana-secret-here
+
+# Keycloak User Passwords (use strong passwords)
+KEYCLOAK_ADMIN_PASSWORD=your-secure-admin-password
+KEYCLOAK_USER_PASSWORD=your-secure-user-password
+KEYCLOAK_VIEWER_PASSWORD=your-secure-viewer-password
+
+# Grafana Base URL (for OAuth redirect URIs)
+GRAFANA_BASE_URL=https://your-grafana-domain.com
+
+# Prometheus Keycloak Authentication
+KEYCLOAK_USERNAME=your-prometheus-username
+KEYCLOAK_PASSWORD=your-prometheus-password
+```
+
+### Keycloak Realm Setup Process
+
+1. **Set Environment Variables**: Export the variables listed above
+2. **Run Substitution Script**:
+   ```bash
+   ./keycloak-env-substitute.sh
+   ```
+3. **Import Realm**: Import the modified `configs/keycloak/realm-export.json` into Keycloak
+4. **Secure Storage**: The realm file is now excluded from git (see `.gitignore`)
 
 ### Network Security
 - Services communicate via isolated Docker network

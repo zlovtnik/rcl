@@ -4,8 +4,8 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 #[cfg(test)]
 use serial_test::serial;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 // Phase 5.2: Structured logging support
@@ -13,28 +13,29 @@ use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt, util::S
 #[allow(dead_code)]
 pub struct BatchId(pub String);
 
+/// Shared counter for all BatchId instances to prevent ID collisions
+static SHARED_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 impl BatchId {
     /// Generate a new batch ID based on timestamp and counter
     #[allow(dead_code)]
     pub fn new() -> Self {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let counter = SHARED_COUNTER.fetch_add(1, Ordering::SeqCst);
         BatchId(format!("{}-{}", timestamp, counter))
     }
 
     /// Generate from pipeline name and timestamp for easier debugging
     #[allow(dead_code)]
     pub fn for_pipeline(pipeline_name: &str) -> Self {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let counter = SHARED_COUNTER.fetch_add(1, Ordering::SeqCst);
         BatchId(format!("{}-{}-{}", pipeline_name, timestamp, counter))
     }
 }
@@ -91,7 +92,7 @@ impl LogSampler {
     #[allow(dead_code)]
     pub fn should_log(&self) -> bool {
         let count = self.counter.fetch_add(1, Ordering::Relaxed);
-        count % self.sample_rate == 0
+        count.is_multiple_of(self.sample_rate)
     }
 
     /// Reset counter for new phase
@@ -223,6 +224,7 @@ mod tests {
             otlp_endpoint: None,
             health_check_timeout_ms: 5000,
             shutdown_timeout: "30s".to_string(),
+            memory: crate::config::MemoryConfig::default(),
         };
 
         let guard = init(&cfg).expect("init should succeed");

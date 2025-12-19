@@ -29,7 +29,7 @@ Rust-based ingestion service that pulls from Kafka, validates/unwraps payloads (
     "env": "dev",
     "telemetry": {
       "metrics_port": 9090,
-      "tracing": { "otlp_endpoint": "http://otel-collector:4317" }
+      "tracing": { "otlp_endpoint": "http://otel-collector:4317/" }
     }
   },
   "kafka": {

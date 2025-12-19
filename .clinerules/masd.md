@@ -22,6 +22,8 @@ Rust-based CDC (Change Data Capture) pipeline: Kafka → Debezium decoder → EI
 - [Health Registry](src/health.rs): Tracks Kafka/Postgres/pipeline statuses via `ComponentStatus` (Healthy/Degraded/Unhealthy).
 - [Shutdown Coordinator](src/shutdown.rs): Broadcast channel for graceful shutdown signals to all tasks.
 - [Metrics](src/metrics.rs): Prometheus metrics with HTTP endpoints (`/metrics`, `/health`, `/ready`).
+- [Offset Tracker](src/offset_tracker.rs): Persists consumed offsets to Postgres `offset_tracker` table for recovery on restart (exactly-once semantics).
+- [Retry Strategy](src/retry.rs): Exponential backoff with jitter for retryable errors (TransportError).
 - [OpenTelemetry Integration](otel-collector-config.yaml): Distributed tracing support via OTLP endpoint.
 
 ## 🛠 Developer Workflow
@@ -47,7 +49,8 @@ Rust-based CDC (Change Data Capture) pipeline: Kafka → Debezium decoder → EI
 - `cargo run -- load-test [--rate <rate>] [--duration-sec <seconds>]` - Generate synthetic load (default: 1000 msg/sec, 60 sec)
 
 **Database Notes:**
-- Schema in `sql/staging_tables.sql` defines table structure.
+- Schema in `sql/staging_tables.sql` defines staging table structure.
+- Offset tracking table (`offset_tracker`) auto-created during Writer initialization (see `sql/offset_tracker.sql`).
 - Use `sqlx::query()` (runtime) not `sqlx::query!()` (compile-time) because table names are dynamic (staging pattern).
 - `RecordMeta::extract(value)` pulls metadata (`_meta_topic`, `_meta_partition`, `_meta_offset`, `_meta_ingest_ts`) + `operation_type` from JSON.
 
@@ -331,10 +334,11 @@ curl http://localhost:9090/metrics | grep -E "(lag_ms|processing_failures|messag
 
 ## ⚠️ Critical Implementation Details
 
-### Retry Logic & Resilience
-- `TransportError` only: Use `backoff::future::retry()` with `ExponentialBackoff` (configured in `writer.rs`).
-- Jitter prevents thundering herd when Postgres recovers.
+##**Only `TransportError` is retried**: Use `backoff::future::retry()` with `ExponentialBackoff` (configured in `src/retry.rs` and `writer.rs`).
+- Exponential backoff policy: starts at ~1ms, doubles each retry, includes jitter to prevent thundering herd when Postgres recovers.
 - Max retries prevent infinite loops on permanent failures (e.g., table doesn't exist).
+- If all retries exhausted: `ProcessingError` sent to DLQ, offset committed (poison pill protection).
+- **Permanent errors** (ValidationError, ProcessingError, DebeziumError) skip retry and route directly to DLQ
 - If all retries exhausted: `ProcessingError` sent to DLQ, offset committed (poison pill protection).
 
 ### Writer Fallback Strategy
@@ -343,9 +347,11 @@ curl http://localhost:9090/metrics | grep -E "(lag_ms|processing_failures|messag
 3. If INSERT fails: Emit `ProcessingError` → DLQ.
 - Metadata extraction via `RecordMeta::extract()` must occur BEFORE writing to preserve correlation.
 
-### Consumer Offset Management
-- Offsets committed ONLY after successful DB write (at-least-once semantics).
+### Consumer Offset Management, exactly-once with idempotent writes).
+- `OffsetTracker` persists partition offsets to Postgres `offset_tracker` table for recovery on restart.
 - On consumer lag spike: Health registry marks Kafka as `Degraded` (staleness > `health_check_timeout_ms`).
+- Replay mode (`cargo run -- replay`) allows re-processing messages by seeking to specific offsets without affecting stored offset state.
+- Query `SELECT * FROM offset_tracker` to inspect stored offset state per pipeline/topic/partitionout_ms`).
 - Replay mode (`cargo run -- replay`) allows re-processing messages by seeking to specific offsets.
 
 ### Metrics Tracking

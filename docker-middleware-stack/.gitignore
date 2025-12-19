@@ -63,3 +63,6 @@ __pycache__/
 # Configuration overrides
 config.local/
 configs.local/
+
+# Keycloak realm with placeholders (regenerate with keycloak-env-substitute.sh)
+configs/keycloak/realm-export.json

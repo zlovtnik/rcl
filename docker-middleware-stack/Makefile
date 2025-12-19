@@ -1,4 +1,11 @@
-.PHONY: help up down restart logs clean status health backup restore
+.PHONY: help up down restart logs clean status health backup restore check-env test
+
+# Check required environment variables
+check-env: ## Check that required JMX environment variables are set
+	@echo "Checking required JMX environment variables..."
+	@if [ -z "$$JMX_USERNAME" ]; then echo "ERROR: JMX_USERNAME is not set"; exit 1; fi
+	@if [ -z "$$JMX_PASSWORD" ]; then echo "ERROR: JMX_PASSWORD is not set"; exit 1; fi
+	@echo "All required JMX environment variables are set."
 
 # Default target
 help: ## Show this help message
@@ -7,7 +14,7 @@ help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-15s %s\n", $$1, $$2}'
 
 # Development commands
-up: ## Start all services
+up: check-env ## Start all services
 	docker-compose up -d
 
 up-build: ## Start all services and rebuild images
@@ -90,14 +97,15 @@ prune: ## Deep clean: stop services, remove containers, volumes, and images
 # Backup and restore
 backup: ## Backup all persistent data
 	@echo "Creating backup directory..."
-	@mkdir -p backups/$(shell date +%Y%m%d_%H%M%S)
+	$(eval TIMESTAMP := $(shell date +%Y%m%d_%H%M%S))
+	@mkdir -p backups/$(TIMESTAMP)
 	@echo "Backing up PostgreSQL data..."
-	@docker run --rm -v middleware_postgres_data:/data -v $(shell pwd)/backups/$(shell date +%Y%m%d_%H%M%S):/backup alpine tar czf /backup/postgres.tar.gz -C /data .
+	@docker run --rm -v middleware_postgres_data:/data -v $(shell pwd)/backups/$(TIMESTAMP):/backup alpine tar czf /backup/postgres.tar.gz -C /data .
 	@echo "Backing up Redis data..."
-	@docker run --rm -v middleware_redis_data:/data -v $(shell pwd)/backups/$(shell date +%Y%m%d_%H%M%S):/backup alpine tar czf /backup/redis.tar.gz -C /data .
+	@docker run --rm -v middleware_redis_data:/data -v $(shell pwd)/backups/$(TIMESTAMP):/backup alpine tar czf /backup/redis.tar.gz -C /data .
 	@echo "Backing up MinIO data..."
-	@docker run --rm -v middleware_minio_data:/data -v $(shell pwd)/backups/$(shell date +%Y%m%d_%H%M%S):/backup alpine tar czf /backup/minio.tar.gz -C /data .
-	@echo "Backup complete: backups/$(shell date +%Y%m%d_%H%M%S)"
+	@docker run --rm -v middleware_minio_data:/data -v $(shell pwd)/backups/$(TIMESTAMP):/backup alpine tar czf /backup/minio.tar.gz -C /data .
+	@echo "Backup complete: backups/$(TIMESTAMP)"
 
 restore: ## Restore data from backup (usage: make restore BACKUP_DIR=backups/20231218_143022)
 	@if [ -z "$(BACKUP_DIR)" ]; then echo "Usage: make restore BACKUP_DIR=backups/20231218_143022"; exit 1; fi
@@ -110,16 +118,24 @@ restore: ## Restore data from backup (usage: make restore BACKUP_DIR=backups/202
 	@docker run --rm -v middleware_minio_data:/data -v $(shell pwd)/$(BACKUP_DIR):/backup alpine sh -c "cd /data && tar xzf /backup/minio.tar.gz"
 	@echo "Restore complete. Restart services with 'make up'"
 
+# Portable timeout function for cross-platform compatibility
+# Uses gtimeout (GNU coreutils) if available, otherwise timeout, otherwise shell-based fallback
+define timeout_cmd
+	$(if $(shell command -v gtimeout 2>/dev/null),gtimeout $1 $2, \
+		$(if $(shell command -v timeout 2>/dev/null),timeout $1 $2, \
+			sh -c '$2 & pid=$$!; (sleep $1 && kill $$pid 2>/dev/null &) & killer=$$!; wait $$pid 2>/dev/null; kill $$killer 2>/dev/null; exit $$?' _ ))
+endef
+
 # Development helpers
 dev: ## Start stack in development mode with logging
 	docker-compose up
 
 test: ## Run a quick health check on all services
 	@echo "Testing service connectivity..."
-	@timeout 5 bash -c 'until docker-compose exec -T postgres pg_isready -U middleware; do sleep 1; done' && echo "✓ PostgreSQL ready" || echo "✗ PostgreSQL not ready"
-	@timeout 5 bash -c 'until docker-compose exec -T redis redis-cli ping | grep PONG; do sleep 1; done' && echo "✓ Redis ready" || echo "✗ Redis not ready"
-	@timeout 10 bash -c 'until curl -f http://localhost:8080/health/ready; do sleep 1; done' && echo "✓ Keycloak ready" || echo "✗ Keycloak not ready"
-	@timeout 5 bash -c 'until curl -f http://localhost:9090/-/healthy; do sleep 1; done' && echo "✓ Prometheus ready" || echo "✗ Prometheus not ready"
+	@$(call timeout_cmd,5,bash -c 'until docker-compose exec -T postgres pg_isready -U middleware; do sleep 1; done') && echo "✓ PostgreSQL ready" || echo "✗ PostgreSQL not ready"
+	@$(call timeout_cmd,5,bash -c 'until docker-compose exec -T redis redis-cli ping | grep PONG; do sleep 1; done') && echo "✓ Redis ready" || echo "✗ Redis not ready"
+	@$(call timeout_cmd,10,bash -c 'until curl -f http://localhost:8080/health/ready; do sleep 1; done') && echo "✓ Keycloak ready" || echo "✗ Keycloak not ready"
+	@$(call timeout_cmd,5,bash -c 'until curl -f http://localhost:9090/-/healthy; do sleep 1; done') && echo "✓ Prometheus ready" || echo "✗ Prometheus not ready"
 	@echo "Health check complete"
 
 # Info commands

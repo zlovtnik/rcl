@@ -106,7 +106,7 @@ The dashboard is automatically loaded if you add this to your `docker-compose.ym
 grafana:
   volumes:
     - ./docker-middleware-stack/configs/grafana/dashboards:/etc/grafana/provisioning/dashboards
-    - ./docker-middleware-stack/configs/grafana/provisioning:/etc/grafana/provisioning/dashboards/rcl
+    - ./docker-middleware-stack/configs/grafana/provisioning:/etc/grafana/provisioning
 ```
 
 Then restart Grafana:

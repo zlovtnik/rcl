@@ -6,6 +6,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use tracing::{debug, info};
 
 /// Core abstractions for Enterprise Integration Patterns
 
@@ -131,18 +132,25 @@ impl Pipeline {
         msg: Value,
     ) -> Result<Vec<Value>, ProcessingError> {
         let mut current_messages = vec![msg];
+        info!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, initial_messages = 1, "starting pipeline execution");
 
-        for stage in &self.stages {
+        for (stage_idx, stage) in self.stages.iter().enumerate() {
             let mut next_messages = Vec::new();
+            let messages_entering_stage = current_messages.len();
+            info!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, stage_index = stage_idx, messages_entering = messages_entering_stage, "processing stage");
 
             for msg in current_messages {
                 let result = stage.process(ctx, msg).await?;
                 match result {
-                    StageResult::Continue(new_msg) => next_messages.push(new_msg),
+                    StageResult::Continue(new_msg) => {
+                        debug!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, stage_index = stage_idx, "message continued to next stage");
+                        next_messages.push(new_msg);
+                    }
                     StageResult::Skip => {
-                        // Skip this message
+                        info!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, stage_index = stage_idx, "message skipped");
                     }
                     StageResult::Split(msgs) => {
+                        info!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, stage_index = stage_idx, split_count = msgs.len(), "message split");
                         next_messages.extend(msgs);
                     }
                     StageResult::Error(err) => {
@@ -151,13 +159,16 @@ impl Pipeline {
                 }
             }
 
+            info!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, stage_index = stage_idx, messages_entering = messages_entering_stage, messages_exiting = next_messages.len(), "stage processing completed");
             current_messages = next_messages;
 
             if current_messages.is_empty() {
+                info!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, stage_index = stage_idx, "pipeline halted: no messages left after stage");
                 break;
             }
         }
 
+        info!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, final_message_count = current_messages.len(), "pipeline execution finished");
         Ok(current_messages)
     }
 }

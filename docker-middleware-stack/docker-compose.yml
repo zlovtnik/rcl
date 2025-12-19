@@ -72,6 +72,10 @@ services:
       SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:9093
       SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
       SCHEMA_REGISTRY_JMX_PORT: 1099
+      SCHEMA_REGISTRY_JMX_OPTS: "-Dcom.sun.management.jmxremote -Dcom.sun.management.jmxremote.authenticate=true -Dcom.sun.management.jmxremote.ssl=false -Dcom.sun.management.jmxremote.local.only=false -Dcom.sun.management.jmxremote.port=1099 -Dcom.sun.management.jmxremote.rmi.port=1099 -Dcom.sun.management.jmxremote.password.file=/opt/schema-registry/jmxremote.password -Dcom.sun.management.jmxremote.access.file=/opt/schema-registry/jmxremote.access"
+    volumes:
+      - ./configs/schema-registry/jmxremote.password:/opt/schema-registry/jmxremote.password
+      - ./configs/schema-registry/jmxremote.access:/opt/schema-registry/jmxremote.access
     networks:
       - middleware
     healthcheck:
@@ -89,6 +93,9 @@ services:
       - schema-registry
     ports:
       - "5556:5556"
+    environment:
+      JMX_USERNAME: ${JMX_USERNAME}
+      JMX_PASSWORD: ${JMX_PASSWORD}
     volumes:
       - ./configs/schema-registry/jmx_exporter_config.yml:/opt/bitnami/jmx-exporter/config.yml
     command: ["5556", "/opt/bitnami/jmx-exporter/config.yml"]

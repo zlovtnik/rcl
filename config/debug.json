@@ -2,7 +2,7 @@
   "service": {
     "log_level": "debug",
     "metrics_port": 9091,
-    "otlp_endpoint": "http://localhost:4317",
+    "otlp_endpoint": "http://localhost:4317/",
     "health_check_timeout_ms": 5000,
     "shutdown_timeout_ms": 30000,
     "batch_flush_interval_ms": 100,

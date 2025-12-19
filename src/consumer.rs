@@ -15,8 +15,8 @@ use anyhow::Result;
 use futures::StreamExt;
 use rdkafka::Message;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
-use rdkafka::message::OwnedMessage;
 use rdkafka::message::Headers;
+use rdkafka::message::OwnedMessage;
 use rdkafka::producer::FutureProducer;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -75,9 +75,11 @@ impl PipelineChannelRegistry {
 async fn run_fetch_loop(
     consumer: Arc<StreamConsumer>,
     channel_registry: Arc<parking_lot::Mutex<PipelineChannelRegistry>>,
+    topic_to_pipeline: HashMap<String, String>,
     metrics: Metrics,
     health: Arc<HealthRegistry>,
     last_poll: Arc<AtomicU64>,
+    memory_config: crate::config::MemoryConfig,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     let mut stream = consumer.stream();
@@ -88,12 +90,28 @@ async fn run_fetch_loop(
                 break;
             }
             message = tokio::time::timeout(Duration::from_secs(30), stream.next()) => {
+                // Check memory usage before processing messages
+                let should_pause = if let Some(usage) = memory_stats::memory_stats() {
+                    let memory_bytes = usage.physical_mem;
+                    let max_bytes = memory_config.max_memory_mb * 1024 * 1024;
+                    memory_bytes > max_bytes.try_into().unwrap()
+                } else {
+                    false
+                };
+
+                if should_pause {
+                    warn!("Memory usage high, pausing Kafka consumption");
+                    // Sleep for a short time before checking again
+                    tokio::time::sleep(Duration::from_millis(memory_config.memory_check_interval_ms)).await;
+                    continue;
+                }
+
                 match message {
                     Ok(Some(Ok(msg))) => {
                         last_poll.store(
                             SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
-                                .unwrap()
+                                .unwrap_or_default()
                                 .as_millis() as u64,
                             Ordering::Relaxed,
                         );
@@ -128,8 +146,15 @@ async fn run_fetch_loop(
 
                         if let Some(tx) = tx {
                             let topic_for_log = ctx.topic.clone();
+                            let ctx_clone = ctx.clone();
                             if tx.send((ctx, msg.detach())).await.is_err() {
                                 warn!("pipeline channel closed for topic {}", topic_for_log);
+                            } else {
+                                // Increment channel depth metric on successful send
+                                if let Some(pipeline_name) = topic_to_pipeline.get(&ctx_clone.topic) {
+                                    let gauge = metrics.channel_depth_per_pipeline.with_label_values(&[pipeline_name]);
+                                    gauge.inc();
+                                }
                             }
                         } else {
                             warn!("no pipeline channel for topic {}", ctx.topic);
@@ -139,7 +164,7 @@ async fn run_fetch_loop(
                         last_poll.store(
                             SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
-                                .unwrap()
+                                .unwrap_or_default()
                                 .as_millis() as u64,
                             Ordering::Relaxed,
                         );
@@ -153,7 +178,7 @@ async fn run_fetch_loop(
                         last_poll.store(
                             SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
-                                .unwrap()
+                                .unwrap_or_default()
                                 .as_millis() as u64,
                             Ordering::Relaxed,
                         );
@@ -181,7 +206,7 @@ async fn run_heartbeat_task(
             _ = interval.tick() => {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_millis() as u64;
                 let last = last_poll.load(Ordering::Relaxed);
                 metrics.last_poll_timestamp.set(last as i64);
@@ -225,6 +250,38 @@ async fn run_circuit_breaker_metrics_task(
     }
 }
 
+async fn run_memory_monitor_task(
+    metrics: Metrics,
+    memory_config: crate::config::MemoryConfig,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) {
+    let mut interval = interval(Duration::from_millis(memory_config.memory_check_interval_ms));
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                info!("memory monitor task shutting down");
+                break;
+            }
+            _ = interval.tick() => {
+                if let Some(usage) = memory_stats::memory_stats() {
+                    let memory_bytes = usage.physical_mem as i64;
+                    metrics.memory_usage_bytes.set(memory_bytes);
+
+                    // Check if memory usage exceeds limit
+                    let max_bytes = (memory_config.max_memory_mb * 1024 * 1024) as i64;
+                    if memory_bytes > max_bytes {
+                        warn!(
+                            memory_used_mb = memory_bytes / 1024 / 1024,
+                            memory_limit_mb = memory_config.max_memory_mb,
+                            "Memory usage exceeds configured limit"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Processes incoming Kafka messages from the given receiver for a specific pipeline.
 ///
 /// Receives messages for a single pipeline from `rx`, routes each message through the pipeline
@@ -241,6 +298,10 @@ async fn run_pipeline_processing_loop(
     let mut stream = ReceiverStream::new(rx);
 
     while let Some((ctx, msg)) = stream.next().await {
+        // Decrement channel depth metric on message receipt
+        let gauge = context.metrics.channel_depth_per_pipeline.with_label_values(&[&pipeline.name]);
+        gauge.dec();
+
         // Check circuit breaker before processing
         if context.circuit_breaker.try_execute().is_err() {
             // Extract payload for DLQ publishing
@@ -387,7 +448,7 @@ impl PipelineProcessingContext {
         pipeline: &Pipeline,
         ctx: &MessageContext,
     ) -> Result<(), ProcessingError> {
-        info!(context = %ctx.correlation_id(), "processing message");
+        info!(context = %ctx.correlation_id(), topic = %ctx.topic, partition = %ctx.partition, offset = %ctx.offset, "processing message");
         let mut decoded = decode_and_validate(payload.as_bytes(), &pipeline.config)?;
 
         if let serde_json::Value::Object(ref mut map) = decoded {
@@ -421,7 +482,9 @@ impl PipelineProcessingContext {
             ),
         };
 
+        info!(context = %ctx.correlation_id(), pipeline = %pipeline.name, stages = pipeline.stages.len(), "executing pipeline stages");
         let processed_messages = pipeline.execute(&stage_ctx, decoded).await?;
+        info!(context = %ctx.correlation_id(), messages_after_stages = processed_messages.len(), "pipeline execution completed");
 
         // Batch processed messages
         for msg in processed_messages {
@@ -434,6 +497,7 @@ impl PipelineProcessingContext {
             let table = crate::config::validate_table_identifier(candidate)
                 .map_err(|e| ProcessingError::Validation(ValidationError::new(e.to_string())))?;
 
+            info!(context = %ctx.correlation_id(), table = %table, "adding to batcher");
             self.add_to_batcher(&pipeline.name, table, msg.clone(), ctx)
                 .await?;
         }
@@ -464,8 +528,16 @@ impl PipelineProcessingContext {
         let public_reason = reason.public_reason();
         if let Some(producer) = self.producer.as_ref() {
             if let Some(dlq_cfg) = pipeline.config.dlq.as_ref() {
-                if let Err(err) =
-                    dlq::publish(producer, &pipeline.name, dlq_cfg, ctx, reason, payload, None).await
+                if let Err(err) = dlq::publish(
+                    producer,
+                    &pipeline.name,
+                    dlq_cfg,
+                    ctx,
+                    reason,
+                    payload,
+                    ctx.retry_count,
+                )
+                .await
                 {
                     error!(
                         context = %ctx.correlation_id(),
@@ -816,12 +888,13 @@ pub async fn run(
     let shutdown_rx_heartbeat = shutdown_rx.resubscribe();
     let shutdown_rx_fetch = shutdown_rx.resubscribe();
     let shutdown_rx_metrics = shutdown_rx.resubscribe();
+    let shutdown_rx_memory = shutdown_rx.resubscribe();
 
     let consumer = Arc::new(build_consumer(&cfg.kafka)?);
     let last_poll = Arc::new(AtomicU64::new(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as u64,
     ));
 
@@ -841,6 +914,7 @@ pub async fn run(
 
     // Create per-pipeline channels and batchers
     let mut channels_by_topic = HashMap::new();
+    let mut topic_to_pipeline = HashMap::new();
     let mut processing_tasks = Vec::new();
     let mut circuit_breakers_by_pipeline = HashMap::new();
 
@@ -854,6 +928,10 @@ pub async fn run(
         // Create channel for this pipeline
         let (tx, rx) = mpsc::channel::<(MessageContext, OwnedMessage)>(capacity);
         channels_by_topic.insert(topic.clone(), PipelineChannels { tx });
+        topic_to_pipeline.insert(topic.clone(), pipeline_name.clone());
+
+        // Initialize channel depth metric to 0
+        metrics.channel_depth_per_pipeline.with_label_values(&[&pipeline_name]).set(0);
 
         // Create batcher for this pipeline
         let batcher_config = BatcherConfig::from_pipeline_config(
@@ -955,9 +1033,11 @@ pub async fn run(
     let fetch_loop = tokio::spawn(run_fetch_loop(
         consumer.clone(),
         channel_registry,
+        topic_to_pipeline,
         metrics.clone(),
         health.clone(),
         last_poll.clone(),
+        cfg.service.memory.clone(),
         shutdown_rx_fetch,
     ));
 
@@ -976,8 +1056,15 @@ pub async fn run(
         shutdown_rx_metrics,
     ));
 
+    // Spawn memory monitor task
+    let memory_monitor_task = tokio::spawn(run_memory_monitor_task(
+        metrics.clone(),
+        cfg.service.memory.clone(),
+        shutdown_rx_memory,
+    ));
+
     // Wait for fetch and heartbeat to complete, then join all processing tasks
-    let _ = tokio::join!(fetch_loop, heartbeat_task, circuit_breaker_metrics_task);
+    let _ = tokio::join!(fetch_loop, heartbeat_task, circuit_breaker_metrics_task, memory_monitor_task);
 
     for task in processing_tasks {
         let _ = task.await;
@@ -1010,6 +1097,9 @@ fn build_consumer(cfg: &KafkaConfig) -> Result<StreamConsumer> {
         .set("group.id", &cfg.group_id)
         .set("enable.partition.eof", "false")
         .set("session.timeout.ms", cfg.session_timeout_ms.to_string())
+        .set("socket.timeout.ms", "30000") // 30 second timeout for socket operations
+        .set("connections.max.idle.ms", "540000") // 9 minutes
+        .set("request.timeout.ms", "30000") // 30 second timeout for broker requests
         .set("enable.auto.commit", "false")
         .set("enable.auto.offset.store", "false")
         .set("auto.offset.reset", "earliest")

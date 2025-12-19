@@ -2,8 +2,8 @@ use crate::health::{ComponentStatus, HealthRegistry};
 use anyhow::Result;
 use axum::{Router, routing::get};
 use prometheus::{
-    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
-    Registry, TextEncoder,
+    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -52,7 +52,6 @@ pub struct Metrics {
     pub batch_size_per_pipeline: HistogramVec,
     #[allow(dead_code)]
     pub batch_flush_reason_per_pipeline: IntCounterVec,
-    #[allow(dead_code)]
     pub channel_depth_per_pipeline: IntGaugeVec,
     #[allow(dead_code)]
     pub write_throughput_bytes_per_pipeline: IntCounterVec,
@@ -64,6 +63,12 @@ pub struct Metrics {
     pub circuit_breaker_state_per_pipeline: IntGaugeVec,
     #[allow(dead_code)]
     pub inflight_batches_per_pipeline: IntGaugeVec,
+    // Throughput metrics
+    pub write_throughput_records_per_second_per_pipeline: IntGaugeVec,
+    #[allow(dead_code)]
+    pub memory_usage_bytes: IntGauge,
+    #[allow(dead_code)]
+    pub memory_usage_per_pipeline: IntGaugeVec,
 }
 
 impl Metrics {
@@ -276,6 +281,14 @@ impl Metrics {
             &["pipeline"],
         )?;
 
+        let write_throughput_records_per_second_per_pipeline = IntGaugeVec::new(
+            Opts::new(
+                "write_throughput_records_per_second_per_pipeline",
+                "Current write throughput in records per second per pipeline",
+            ),
+            &["pipeline"],
+        )?;
+
         registry.register(Box::new(batch_size_per_pipeline.clone()))?;
         registry.register(Box::new(batch_flush_reason_per_pipeline.clone()))?;
         registry.register(Box::new(channel_depth_per_pipeline.clone()))?;
@@ -284,6 +297,23 @@ impl Metrics {
         registry.register(Box::new(retry_attempts_per_pipeline.clone()))?;
         registry.register(Box::new(circuit_breaker_state_per_pipeline.clone()))?;
         registry.register(Box::new(inflight_batches_per_pipeline.clone()))?;
+        registry.register(Box::new(write_throughput_records_per_second_per_pipeline.clone()))?;
+
+        // Memory management metrics
+        let memory_usage_bytes = IntGauge::new(
+            "memory_usage_bytes",
+            "Current process memory usage in bytes",
+        )?;
+        let memory_usage_per_pipeline = IntGaugeVec::new(
+            Opts::new(
+                "memory_usage_per_pipeline",
+                "Estimated memory usage per pipeline in bytes",
+            ),
+            &["pipeline"],
+        )?;
+
+        registry.register(Box::new(memory_usage_bytes.clone()))?;
+        registry.register(Box::new(memory_usage_per_pipeline.clone()))?;
 
         Ok(Self {
             messages_total,
@@ -312,6 +342,9 @@ impl Metrics {
             retry_attempts_per_pipeline,
             circuit_breaker_state_per_pipeline,
             inflight_batches_per_pipeline,
+            write_throughput_records_per_second_per_pipeline,
+            memory_usage_bytes,
+            memory_usage_per_pipeline,
         })
     }
 }
@@ -933,13 +966,16 @@ mod tests {
         let metrics = Metrics::register(&registry).expect("should register metrics");
 
         // Test setting circuit breaker states for different pipelines
-        metrics.circuit_breaker_state
+        metrics
+            .circuit_breaker_state
             .with_label_values(&["pipeline1"])
             .set(circuit_breaker_states::STATE_CLOSED);
-        metrics.circuit_breaker_state
+        metrics
+            .circuit_breaker_state
             .with_label_values(&["pipeline2"])
             .set(circuit_breaker_states::STATE_OPEN);
-        metrics.circuit_breaker_state
+        metrics
+            .circuit_breaker_state
             .with_label_values(&["pipeline3"])
             .set(circuit_breaker_states::STATE_HALF_OPEN);
 
@@ -962,25 +998,30 @@ mod tests {
         let metrics = Metrics::register(&registry).expect("should register metrics");
 
         // Increment circuit breaker open events for different pipelines
-        metrics.circuit_breaker_opens_total
+        metrics
+            .circuit_breaker_opens_total
             .with_label_values(&["pipeline1"])
             .inc();
-        metrics.circuit_breaker_opens_total
+        metrics
+            .circuit_breaker_opens_total
             .with_label_values(&["pipeline1"])
             .inc();
-        metrics.circuit_breaker_opens_total
+        metrics
+            .circuit_breaker_opens_total
             .with_label_values(&["pipeline2"])
             .inc();
 
         // Verify the metrics are registered and callable
         assert_eq!(
-            metrics.circuit_breaker_opens_total
+            metrics
+                .circuit_breaker_opens_total
                 .with_label_values(&["pipeline1"])
                 .get(),
             2
         );
         assert_eq!(
-            metrics.circuit_breaker_opens_total
+            metrics
+                .circuit_breaker_opens_total
                 .with_label_values(&["pipeline2"])
                 .get(),
             1
@@ -993,28 +1034,34 @@ mod tests {
         let metrics = Metrics::register(&registry).expect("should register metrics");
 
         // Increment circuit breaker closed events (transitions from Open to Closed)
-        metrics.circuit_breaker_closed_total
+        metrics
+            .circuit_breaker_closed_total
             .with_label_values(&["pipeline1"])
             .inc();
-        metrics.circuit_breaker_closed_total
+        metrics
+            .circuit_breaker_closed_total
             .with_label_values(&["pipeline1"])
             .inc();
-        metrics.circuit_breaker_closed_total
+        metrics
+            .circuit_breaker_closed_total
             .with_label_values(&["pipeline1"])
             .inc();
-        metrics.circuit_breaker_closed_total
+        metrics
+            .circuit_breaker_closed_total
             .with_label_values(&["pipeline2"])
             .inc_by(2);
 
         // Verify counter values using direct metric access
         assert_eq!(
-            metrics.circuit_breaker_closed_total
+            metrics
+                .circuit_breaker_closed_total
                 .with_label_values(&["pipeline1"])
                 .get(),
             3
         );
         assert_eq!(
-            metrics.circuit_breaker_closed_total
+            metrics
+                .circuit_breaker_closed_total
                 .with_label_values(&["pipeline2"])
                 .get(),
             2
@@ -1065,40 +1112,48 @@ mod tests {
         let metrics = Metrics::register(&registry).expect("should register metrics");
 
         // Record successful retries after various attempt counts
-        metrics.retry_success_after_n_attempts
+        metrics
+            .retry_success_after_n_attempts
             .with_label_values(&["1"])
-            .inc_by(10);  // 10 successful writes on first attempt
-        metrics.retry_success_after_n_attempts
+            .inc_by(10); // 10 successful writes on first attempt
+        metrics
+            .retry_success_after_n_attempts
             .with_label_values(&["2"])
-            .inc_by(5);   // 5 successful writes after 1 retry
-        metrics.retry_success_after_n_attempts
+            .inc_by(5); // 5 successful writes after 1 retry
+        metrics
+            .retry_success_after_n_attempts
             .with_label_values(&["3"])
-            .inc_by(2);   // 2 successful writes after 2 retries
-        metrics.retry_success_after_n_attempts
+            .inc_by(2); // 2 successful writes after 2 retries
+        metrics
+            .retry_success_after_n_attempts
             .with_label_values(&["5"])
-            .inc();       // 1 successful write after 4 retries
+            .inc(); // 1 successful write after 4 retries
 
         // Verify counter values directly
         assert_eq!(
-            metrics.retry_success_after_n_attempts
+            metrics
+                .retry_success_after_n_attempts
                 .with_label_values(&["1"])
                 .get(),
             10
         );
         assert_eq!(
-            metrics.retry_success_after_n_attempts
+            metrics
+                .retry_success_after_n_attempts
                 .with_label_values(&["2"])
                 .get(),
             5
         );
         assert_eq!(
-            metrics.retry_success_after_n_attempts
+            metrics
+                .retry_success_after_n_attempts
                 .with_label_values(&["3"])
                 .get(),
             2
         );
         assert_eq!(
-            metrics.retry_success_after_n_attempts
+            metrics
+                .retry_success_after_n_attempts
                 .with_label_values(&["5"])
                 .get(),
             1

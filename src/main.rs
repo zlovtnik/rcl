@@ -68,6 +68,8 @@ enum Commands {
         rate: u32,
         #[arg(short, long, default_value_t = 60)]
         duration_sec: u64,
+        #[arg(short, long, default_value_t = 1)]
+        producers: usize,
     },
 }
 
@@ -143,7 +145,11 @@ async fn main() -> Result<()> {
                 dlq::drain(&cfg.kafka, &topic, output, requeue).await
             }
         },
-        Commands::LoadTest { rate, duration_sec } => load_test::run(cfg, rate, duration_sec).await,
+        Commands::LoadTest {
+            rate,
+            duration_sec,
+            producers,
+        } => load_test::run(cfg, rate, duration_sec, producers).await,
     }
 }
 

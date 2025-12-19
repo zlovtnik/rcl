@@ -119,7 +119,18 @@ impl CircuitBreaker {
                 };
                 let last_open = self.last_open_time.load(Ordering::Relaxed);
 
-                if now - last_open >= self.config.half_open_timeout_ms {
+                // Add clock skew protection: ensure we don't underflow if system clock is adjusted backwards
+                let time_elapsed = if now >= last_open {
+                    now - last_open
+                } else {
+                    warn!(
+                        pipeline_name = %self.pipeline_name,
+                        "system clock skew detected (now < last_open), keeping circuit open for safety"
+                    );
+                    0
+                };
+
+                if time_elapsed >= self.config.half_open_timeout_ms {
                     // Transition to half-open
                     let mut state = self.state.write();
                     if *state == CircuitBreakerState::Open {
@@ -192,10 +203,16 @@ impl CircuitBreaker {
                     let mut state = self.state.write();
                     if *state == CircuitBreakerState::Closed {
                         *state = CircuitBreakerState::Open;
-                        let now = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_millis() as u64;
+                        let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                            Ok(duration) => duration.as_millis() as u64,
+                            Err(_) => {
+                                error!(
+                                    pipeline_name = %self.pipeline_name,
+                                    "system clock error in circuit breaker - using 0 as timestamp"
+                                );
+                                0
+                            }
+                        };
                         self.last_open_time.store(now, Ordering::Relaxed);
                         self.success_count.store(0, Ordering::Relaxed);
 
@@ -213,10 +230,16 @@ impl CircuitBreaker {
                 let mut state = self.state.write();
                 if *state == CircuitBreakerState::HalfOpen {
                     *state = CircuitBreakerState::Open;
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis() as u64;
+                    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                        Ok(duration) => duration.as_millis() as u64,
+                        Err(_) => {
+                            error!(
+                                pipeline_name = %self.pipeline_name,
+                                "system clock error in circuit breaker - using 0 as timestamp"
+                            );
+                            0
+                        }
+                    };
                     self.last_open_time.store(now, Ordering::Relaxed);
                     self.failure_count.store(1, Ordering::Relaxed);
                     self.success_count.store(0, Ordering::Relaxed);

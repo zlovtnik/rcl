@@ -4,6 +4,7 @@
 use anyhow::{Result, anyhow};
 use sqlx::PgPool;
 use std::collections::BTreeMap;
+use tracing::{debug, error, info, warn};
 
 /// OffsetTracker manages Kafka offset commits to a database table
 /// Enables exactly-once processing by persisting offsets alongside data writes
@@ -25,7 +26,11 @@ impl OffsetTracker {
         sqlx::raw_sql(init_sql)
             .execute(&self.pool)
             .await
-            .map_err(|e| anyhow!("Failed to initialize offset_tracker table: {}", e))?;
+            .map_err(|e| {
+                error!("Failed to initialize offset_tracker table: {}", e);
+                anyhow!("Failed to initialize offset_tracker table: {}", e)
+            })?;
+        info!("Successfully initialized offset_tracker table");
         Ok(())
     }
 
@@ -124,8 +129,12 @@ impl OffsetTracker {
 
         tx.commit()
             .await
-            .map_err(|e| anyhow!("Failed to commit offset transaction: {}", e))?;
+            .map_err(|e| {
+                error!(pipeline_name, topic, partition, offset, "Failed to commit offset transaction: {}", e);
+                anyhow!("Failed to commit offset transaction: {}", e)
+            })?;
 
+        debug!(pipeline_name, topic, partition, offset, previous_offset, "Successfully wrote offset");
         Ok(previous_offset)
     }
 
@@ -163,9 +172,14 @@ impl OffsetTracker {
             .bind(pipeline_name)
             .execute(&self.pool)
             .await
-            .map_err(|e| anyhow!("Failed to delete pipeline offsets: {}", e))?;
+            .map_err(|e| {
+                error!(pipeline_name, "Failed to delete pipeline offsets: {}", e);
+                anyhow!("Failed to delete pipeline offsets: {}", e)
+            })?;
 
-        Ok(result.rows_affected())
+        let deleted_count = result.rows_affected();
+        info!(pipeline_name, deleted_count, "Successfully deleted pipeline offsets");
+        Ok(deleted_count)
     }
 
     /// Get all stored offsets (for debugging/monitoring)
@@ -191,15 +205,15 @@ mod tests {
     #[test]
     fn test_offset_cache_insert_and_retrieve() {
         let mut cache: BTreeMap<(String, String, i32), i64> = BTreeMap::new();
-        
+
         // Insert offsets for different partitions of the same topic
         cache.insert(("pipeline1".to_string(), "topic1".to_string(), 0), 100);
         cache.insert(("pipeline1".to_string(), "topic1".to_string(), 1), 200);
         cache.insert(("pipeline1".to_string(), "topic2".to_string(), 0), 300);
-        
+
         // Verify insertion worked correctly
         assert_eq!(cache.len(), 3);
-        
+
         // Verify retrieval
         assert_eq!(
             cache.get(&("pipeline1".to_string(), "topic1".to_string(), 0)),
@@ -219,17 +233,17 @@ mod tests {
     #[test]
     fn test_offset_cache_remove() {
         let mut cache: BTreeMap<(String, String, i32), i64> = BTreeMap::new();
-        
+
         cache.insert(("pipeline1".to_string(), "topic1".to_string(), 0), 100);
         cache.insert(("pipeline1".to_string(), "topic1".to_string(), 1), 200);
-        
+
         assert_eq!(cache.len(), 2);
-        
+
         // Remove an entry
         let removed = cache.remove(&("pipeline1".to_string(), "topic1".to_string(), 0));
         assert_eq!(removed, Some(100));
         assert_eq!(cache.len(), 1);
-        
+
         // Verify the remaining entry is still accessible
         assert_eq!(
             cache.get(&("pipeline1".to_string(), "topic1".to_string(), 1)),
@@ -241,27 +255,27 @@ mod tests {
     #[test]
     fn test_offset_cache_update() {
         let mut cache: BTreeMap<(String, String, i32), i64> = BTreeMap::new();
-        
+
         let key = ("pipeline1".to_string(), "topic1".to_string(), 0);
         cache.insert(key.clone(), 100);
         assert_eq!(cache.get(&key), Some(&100));
-        
+
         // Update the value
         cache.insert(key.clone(), 150);
         assert_eq!(cache.get(&key), Some(&150));
-        assert_eq!(cache.len(), 1);  // Still only 1 entry
+        assert_eq!(cache.len(), 1); // Still only 1 entry
     }
 
     /// Tests cache ordering properties of BTreeMap
     #[test]
     fn test_offset_cache_ordering() {
         let mut cache: BTreeMap<(String, String, i32), i64> = BTreeMap::new();
-        
+
         // Insert in non-alphabetical order
         cache.insert(("z-pipeline".to_string(), "topic".to_string(), 0), 100);
         cache.insert(("a-pipeline".to_string(), "topic".to_string(), 0), 200);
         cache.insert(("m-pipeline".to_string(), "topic".to_string(), 0), 300);
-        
+
         // Verify BTreeMap maintains sorted order
         let keys: Vec<_> = cache.keys().collect();
         assert_eq!(keys[0].0, "a-pipeline");

@@ -448,6 +448,8 @@ impl Batcher {
             .map(|t| Instant::now().duration_since(t))
             .unwrap_or(Duration::from_secs(0));
 
+        info!(pipeline = %buffer.pipeline_name, table = %buffer.table, batch_size = batch_size, batch_bytes = batch_bytes, reason = %reason, latency_ms = latency.as_millis(), "flushing buffer");
+
         let messages = buffer.messages.clone();
         let contexts = buffer.contexts.clone();
         buffer.clear();
@@ -486,6 +488,17 @@ impl Batcher {
                 if self.config.adaptive_batch_enabled {
                     self.adjust_batch_size(latency);
                 }
+
+                // Update throughput metric
+                let throughput = if latency.as_secs_f64() > 0.0 {
+                    (batch_size as f64) / latency.as_secs_f64()
+                } else {
+                    0.0
+                };
+                self.metrics
+                    .write_throughput_records_per_second_per_pipeline
+                    .with_label_values(&[&buffer.pipeline_name])
+                    .set(throughput as i64);
 
                 Ok(())
             }
@@ -670,7 +683,6 @@ impl Batcher {
     /// // let mut batcher = /* create batcher */ ;
     /// // tokio::spawn(async move { let _ = batcher.run_background_flush().await; });
     /// ```
-    #[allow(dead_code)]
     pub async fn run_background_flush(&mut self) -> Result<(), ProcessingError> {
         let mut interval = time::interval(Duration::from_millis(1000)); // Check every second
 

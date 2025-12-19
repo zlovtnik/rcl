@@ -2,7 +2,7 @@
   "realm": "middleware",
   "displayName": "Middleware Stack",
   "enabled": true,
-  "sslRequired": "external",
+  "sslRequired": "all",
   "registrationAllowed": false,
   "loginWithEmailAllowed": true,
   "duplicateEmailsAllowed": false,
@@ -16,7 +16,7 @@
       "description": "Main application client",
       "enabled": true,
       "clientAuthenticatorType": "client-secret",
-      "secret": "middleware-app-secret",
+      "secret": "${KEYCLOAK_MIDDLEWARE_APP_SECRET}",
       "directAccessGrantsEnabled": true,
       "serviceAccountsEnabled": true,
       "implicitFlowEnabled": false,
@@ -48,7 +48,6 @@
           "protocolMapper": "oidc-usermodel-realm-role-mapper",
           "consentRequired": false,
           "config": {
-            "user.attribute": "foo",
             "access.token.claim": "true",
             "claim.name": "realm_access.roles",
             "jsonType.label": "String",
@@ -61,7 +60,6 @@
           "protocolMapper": "oidc-usermodel-client-role-mapper",
           "consentRequired": false,
           "config": {
-            "user.attribute": "foo",
             "access.token.claim": "true",
             "claim.name": "resource_access.${client_id}.roles",
             "jsonType.label": "String",
@@ -102,7 +100,7 @@
       "description": "Grafana OAuth client",
       "enabled": true,
       "clientAuthenticatorType": "client-secret",
-      "secret": "grafana-secret",
+      "secret": "${KEYCLOAK_GRAFANA_SECRET}",
       "directAccessGrantsEnabled": false,
       "serviceAccountsEnabled": false,
       "implicitFlowEnabled": false,
@@ -134,7 +132,6 @@
           "protocolMapper": "oidc-usermodel-realm-role-mapper",
           "consentRequired": false,
           "config": {
-            "user.attribute": "foo",
             "access.token.claim": "true",
             "claim.name": "realm_access.roles",
             "jsonType.label": "String",
@@ -169,10 +166,10 @@
         "microprofile-jwt"
       ],
       "redirectUris": [
-        "http://localhost:3000/login/generic_oauth"
+        "${GRAFANA_BASE_URL}/login/generic_oauth"
       ],
       "webOrigins": [
-        "http://localhost:3000"
+        "${GRAFANA_BASE_URL}"
       ]
     }
   ],
@@ -215,7 +212,6 @@
           "protocolMapper": "oidc-usermodel-realm-role-mapper",
           "consentRequired": false,
           "config": {
-            "user.attribute": "foo",
             "access.token.claim": "true",
             "claim.name": "realm_access.roles",
             "jsonType.label": "String",
@@ -228,7 +224,6 @@
           "protocolMapper": "oidc-usermodel-client-role-mapper",
           "consentRequired": false,
           "config": {
-            "user.attribute": "foo",
             "access.token.claim": "true",
             "claim.name": "resource_access.${client_id}.roles",
             "jsonType.label": "String",
@@ -311,7 +306,7 @@
       "credentials": [
         {
           "type": "password",
-          "value": "admin123",
+          "value": "${KEYCLOAK_ADMIN_PASSWORD}",
           "temporary": false
         }
       ],
@@ -328,7 +323,7 @@
       "credentials": [
         {
           "type": "password",
-          "value": "user123",
+          "value": "${KEYCLOAK_USER_PASSWORD}",
           "temporary": false
         }
       ],
@@ -345,7 +340,7 @@
       "credentials": [
         {
           "type": "password",
-          "value": "viewer123",
+          "value": "${KEYCLOAK_VIEWER_PASSWORD}",
           "temporary": false
         }
       ],

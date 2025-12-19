@@ -2,16 +2,24 @@ use crate::eip::PipelineConfig;
 use crate::errors::{DebeziumError, ProcessingError, ValidationError};
 use crate::types::Operation;
 use serde_json::Value;
+use tracing::{debug, info};
 
 pub fn decode_and_validate(
     payload: &[u8],
     pipeline: &PipelineConfig,
 ) -> Result<Value, ProcessingError> {
     let raw = std::str::from_utf8(payload)?;
+    debug!(payload_size = payload.len(), pipeline = %pipeline.name, "decoding message");
     let mut value: Value = serde_json::from_str(raw)?;
 
     if pipeline.debezium_envelope {
+        debug!(pipeline = %pipeline.name, "unwrapping Debezium envelope");
         value = unwrap_debezium(value)?;
+        if let Some(op) = value.get("operation_type") {
+            info!(pipeline = %pipeline.name, operation = %op, "decoded Debezium message");
+        }
+    } else {
+        debug!(pipeline = %pipeline.name, "no Debezium envelope configured");
     }
 
     validate_required_fields(&value, pipeline)?;

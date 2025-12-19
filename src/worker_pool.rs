@@ -39,6 +39,9 @@ impl OffsetTracker {
         // Record this offset in pending
         pending.insert(offset, ());
 
+        // Capture the current next value before advancing
+        let old_next = *next;
+
         // Check if we can advance the commit frontier
         loop {
             if pending.contains_key(&*next) {
@@ -55,8 +58,8 @@ impl OffsetTracker {
             *watermark = offset;
         }
 
-        // Return true if we made progress
-        offset + 1 == *next
+        // Return true if the frontier moved (any advancement, not just to offset+1)
+        *next > old_next
     }
 
     /// Get the current offset that can be safely committed
@@ -173,14 +176,17 @@ impl WorkerPoolBuilder {
         let metrics = WorkerPoolMetrics::new(self.num_workers);
 
         let mut worker_txs = Vec::new();
+        let mut worker_rxs = Vec::new();
         for _ in 0..self.num_workers {
-            let (tx, _rx) = mpsc::channel(self.worker_channel_capacity);
+            let (tx, rx) = mpsc::channel(self.worker_channel_capacity);
             worker_txs.push(tx);
+            worker_rxs.push(rx);
         }
 
         WorkerPoolCoordinator {
             num_workers: self.num_workers,
             worker_senders: worker_txs,
+            worker_receivers: worker_rxs,
             offset_tracker,
             metrics,
             next_worker: Arc::new(Mutex::new(0)),
@@ -192,6 +198,7 @@ impl WorkerPoolBuilder {
 pub struct WorkerPoolCoordinator {
     num_workers: usize,
     worker_senders: Vec<mpsc::Sender<Vec<u8>>>,
+    worker_receivers: Vec<mpsc::Receiver<Vec<u8>>>,
     pub offset_tracker: OffsetTracker,
     pub metrics: WorkerPoolMetrics,
     next_worker: Arc<Mutex<usize>>,
@@ -228,6 +235,12 @@ impl WorkerPoolCoordinator {
         drop(next);
 
         self.assign_to_worker(worker_id, data).await
+    }
+
+    /// Get the worker receivers (consumes them - call this once to spawn workers)
+    pub fn take_receivers(&mut self) -> Vec<mpsc::Receiver<Vec<u8>>> {
+        // Take the existing receivers and replace with empty vec
+        std::mem::take(&mut self.worker_receivers)
     }
 }
 

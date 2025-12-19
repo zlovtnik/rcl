@@ -97,12 +97,14 @@ pub async fn publish(
     let timestamp = Utc::now().to_rfc3339();
     let retry_count_str = retry_count.unwrap_or(0).to_string();
     let original_size = raw_payload.len();
-    
+
     // Quick estimate: if raw payload alone is close to Kafka limit, we'll likely need iterative truncation
     // Rough budget estimate: overhead + payload + headers. If raw payload approaches this, skip initial sanitization.
-    let rough_max_for_payload = MAX_KAFKA_MESSAGE_BYTES.saturating_sub(HEADER_BUDGET_BYTES).saturating_sub(500);
+    let rough_max_for_payload = MAX_KAFKA_MESSAGE_BYTES
+        .saturating_sub(HEADER_BUDGET_BYTES)
+        .saturating_sub(500);
     let needs_iterative_truncation = original_size > rough_max_for_payload;
-    
+
     // If we don't need iterative truncation, do normal flow with initial sanitization
     let body = if !needs_iterative_truncation {
         let (payload, truncated) =
@@ -115,7 +117,7 @@ pub async fn publish(
             original_size,
             truncated,
         })?;
-        
+
         // Double-check: if even this is over limit, fall through to iterative truncation
         if body_str.len() > MAX_KAFKA_MESSAGE_BYTES {
             None
@@ -132,7 +134,7 @@ pub async fn publish(
     } else {
         warn!(
             topic = %dlq_cfg.topic,
-            message_size = if let Some(b) = &body { b.len() } else { original_size },
+            message_size = original_size,
             max_size = MAX_KAFKA_MESSAGE_BYTES,
             correlation = %correlation,
             "DLQ message exceeds Kafka max size limit, attempting iterative truncation"
@@ -184,7 +186,7 @@ pub async fn publish(
             } else {
                 TRUNCATION_REDUCTION_FACTOR
             };
-            
+
             target_payload_size = (target_payload_size as f64 * reduction_factor) as usize;
 
             warn!(

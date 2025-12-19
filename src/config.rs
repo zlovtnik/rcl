@@ -49,6 +49,8 @@ pub struct ServiceConfig {
     pub health_check_timeout_ms: u64,
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout: String,
+    #[serde(default)]
+    pub memory: MemoryConfig,
 }
 
 fn default_health_check_timeout_ms() -> u64 {
@@ -57,6 +59,39 @@ fn default_health_check_timeout_ms() -> u64 {
 
 fn default_shutdown_timeout() -> String {
     "30s".to_string()
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MemoryConfig {
+    #[serde(default = "default_max_memory_mb")]
+    pub max_memory_mb: u64,
+    #[serde(default = "default_memory_check_interval_ms")]
+    pub memory_check_interval_ms: u64,
+}
+
+fn default_max_memory_mb() -> u64 {
+    1024 // 1GB default
+}
+
+fn default_memory_check_interval_ms() -> u64 {
+    1000 // 1 second
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            max_memory_mb: default_max_memory_mb(),
+            memory_check_interval_ms: default_memory_check_interval_ms(),
+        }
+    }
+}
+
+fn default_copy_format() -> String {
+    "csv".to_string()
+}
+
+fn default_copy_buffer_size() -> usize {
+    65536 // 64KB
 }
 
 impl ServiceConfig {
@@ -126,6 +161,7 @@ mod tests {
             otlp_endpoint: None,
             health_check_timeout_ms: 5000,
             shutdown_timeout: "60s".to_string(),
+            memory: MemoryConfig::default(),
         };
         let dur = svc.shutdown_timeout_duration();
         assert_eq!(dur.as_secs(), 60);
@@ -150,9 +186,10 @@ mod tests {
         let svc = ServiceConfig {
             log_level: LogLevel::Debug,
             metrics_port: 8080,
-            otlp_endpoint: Some("http://localhost:4317".to_string()),
+            otlp_endpoint: Some("http://localhost:4317/".to_string()),
             health_check_timeout_ms: 3000,
             shutdown_timeout: "30s".to_string(),
+            memory: MemoryConfig::default(),
         };
         assert_eq!(svc.metrics_port, 8080);
         assert!(svc.otlp_endpoint.is_some());
@@ -482,6 +519,7 @@ mod tests {
                 otlp_endpoint: None,
                 health_check_timeout_ms: 5000,
                 shutdown_timeout: "30s".to_string(),
+                memory: MemoryConfig::default(),
             },
             kafka: KafkaConfig {
                 brokers: "localhost:9092".to_string(),
@@ -609,7 +647,13 @@ pub struct PostgresConfig {
     pub ssl_root_cert: Option<String>,
     #[serde(default)]
     pub pool: Option<PostgresPoolConfig>,
+    #[serde(default)]
+    pub per_pipeline_pools: bool,
     pub copy_enabled: bool,
+    #[serde(default = "default_copy_format")]
+    pub copy_format: String,
+    #[serde(default = "default_copy_buffer_size")]
+    pub copy_buffer_size: usize,
     pub copy_batch_rows: usize,
     pub insert_batch_rows: usize,
     /// Enable offset tracking for exactly-once semantics (default: false).

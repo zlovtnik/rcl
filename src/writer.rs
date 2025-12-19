@@ -20,7 +20,7 @@ use std::sync::{
     atomic::{AtomicU32, Ordering},
 };
 use std::time::Duration;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 #[derive(Clone, Debug)]
 pub struct RecordMeta {
@@ -195,13 +195,13 @@ impl Writer {
         retry_cfg: RetryConfig,
     ) -> Result<Self, ProcessingError> {
         let mut url = cfg.url.clone();
-        if let Some(root_cert) = &cfg.ssl_root_cert {
-            if !url.contains("sslrootcert=") {
-                let separator = if url.contains('?') { "&" } else { "?" };
-                // Encode spaces in the cert path for URL safety
-                let encoded_cert = root_cert.replace(' ', "%20");
-                url.push_str(&format!("{}sslrootcert={}", separator, encoded_cert));
-            }
+        if let Some(root_cert) = &cfg.ssl_root_cert
+            && !url.contains("sslrootcert=")
+        {
+            let separator = if url.contains('?') { "&" } else { "?" };
+            // Encode spaces in the cert path for URL safety
+            let encoded_cert = root_cert.replace(' ', "%20");
+            url.push_str(&format!("{}sslrootcert={}", separator, encoded_cert));
         }
 
         let mut options = PgConnectOptions::from_str(&url).map_err(|e| {
@@ -219,7 +219,10 @@ impl Writer {
             ];
             let lower_mode = mode.to_lowercase();
             if !valid_modes.contains(&lower_mode.as_str()) {
-                warn!("invalid ssl_mode '{}', expected one of: disable, allow, prefer, require, verify-ca, verify-full; defaulting to 'prefer'", mode);
+                warn!(
+                    "invalid ssl_mode '{}', expected one of: disable, allow, prefer, require, verify-ca, verify-full; defaulting to 'prefer'",
+                    mode
+                );
             }
             let ssl_mode = match lower_mode.as_str() {
                 "disable" => PgSslMode::Disable,
@@ -255,7 +258,10 @@ impl Writer {
         // Initialize offset tracker table
         let offset_tracker = OffsetTracker::new(pool.clone());
         offset_tracker.init().await.map_err(|e| {
-            ProcessingError::from(ValidationError::new(format!("offset tracker init failed: {}", e)))
+            ProcessingError::from(ValidationError::new(format!(
+                "offset tracker init failed: {}",
+                e
+            )))
         })?;
 
         Ok(Self {
@@ -291,39 +297,57 @@ impl Writer {
         self.metrics.batch_size.observe(values.len() as f64);
         let timer = self.metrics.write_latency_seconds.start_timer();
 
+        info!(batch_size = values.len(), table = %table, pipeline = %pipeline_name, "writing batch to database");
+
         // Log operations for debugging
+        let mut operations_summary = std::collections::HashMap::new();
         for val in values {
             let meta = RecordMeta::extract(val);
-            tracing::trace!(operation = %meta.operation, "processing operation");
+            *operations_summary
+                .entry(meta.operation.to_string())
+                .or_insert(0) += 1;
+            debug!(operation = %meta.operation, topic = %meta.topic, partition = %meta.partition, offset = %meta.offset, "processing operation");
         }
+
+        info!(batch_size = values.len(), operations = ?operations_summary, "batch composition");
 
         let attempt_count = Arc::new(AtomicU32::new(0));
         let attempt_count_clone = attempt_count.clone();
 
         let op = || async {
-            attempt_count_clone.fetch_add(1, Ordering::SeqCst);
+            let attempts = attempt_count_clone.fetch_add(1, Ordering::SeqCst) + 1;
+            info!(attempt = attempts, batch_size = values.len(), table = %table, "write attempt");
 
             let mut tx = self
                 .pool
                 .begin()
                 .await
-                .map_err(|e| ProcessingError::from(TransportError::new("pg begin", e)))
+                .map_err(|e| {
+                    warn!(error = %e, attempt = attempts, "failed to begin transaction");
+                    ProcessingError::from(TransportError::new("pg begin", e))
+                })
                 .map_err(backoff::Error::transient)?;
 
             let res = if self.cfg.copy_enabled {
-                match copy_into(&mut *tx, table, values).await {
-                    Ok(_) => Ok(()),
+                debug!(table = %table, "attempting COPY bulk insert");
+                match copy_into(&mut tx, table, values).await {
+                    Ok(_) => {
+                        info!(batch_size = values.len(), table = %table, "COPY insert succeeded");
+                        Ok(())
+                    }
                     Err(err) => {
-                        warn!(table = %table, error = %err, "copy failed, falling back to insert");
-                        insert_batch(&mut *tx, table, values).await
+                        warn!(table = %table, error = %err, "COPY failed, falling back to INSERT");
+                        insert_batch(&mut tx, table, values).await
                     }
                 }
             } else {
-                insert_batch(&mut *tx, table, values).await
+                debug!(table = %table, "using INSERT batch insert");
+                insert_batch(&mut tx, table, values).await
             };
 
             match res {
                 Ok(_) => {
+                    info!(batch_size = values.len(), table = %table, "batch insert succeeded");
                     // Calculate max offsets
                     let mut max_offsets: std::collections::HashMap<(String, i64), i64> =
                         std::collections::HashMap::new();
@@ -341,14 +365,15 @@ impl Writer {
                         // Validate partition fits in i32 to prevent overflow
                         let partition_i32 = i32::try_from(partition).map_err(|_| {
                             backoff::Error::permanent(ProcessingError::Validation(
-                                crate::errors::ValidationError::new(
-                                    format!("partition {} exceeds i32 bounds", partition)
-                                ),
+                                crate::errors::ValidationError::new(format!(
+                                    "partition {} exceeds i32 bounds",
+                                    partition
+                                )),
                             ))
                         })?;
 
                         if let Err(e) = OffsetTracker::write_offset_with_conn(
-                            &mut *tx,
+                            &mut tx,
                             pipeline_name,
                             &topic,
                             partition_i32,
@@ -356,12 +381,8 @@ impl Writer {
                         )
                         .await
                         {
-                            // Convert anyhow::Error to sqlx::Error format for TransportSource compatibility
-                            let sqlx_err = sqlx::Error::Configuration(
-                                format!("offset tracking error: {}", e).into()
-                            );
-                            return Err(backoff::Error::transient(ProcessingError::from(
-                                TransportError::new("offset write", sqlx_err),
+                            return Err(backoff::Error::transient(ProcessingError::Validation(
+                                ValidationError::new(format!("offset tracking error: {}", e))
                             )));
                         }
                     }

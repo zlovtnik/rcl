@@ -7,6 +7,7 @@ use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
+use tracing::{debug, info};
 
 /// Filter Stage - Skip messages that don't match criteria
 #[derive(Debug)]
@@ -585,9 +586,29 @@ impl Stage for TransformerStage {
         ctx: &StageContext,
         mut msg: Value,
     ) -> Result<StageResult, ProcessingError> {
-        for transform in &self.transformations {
-            transform.apply(&mut msg, ctx)?;
+        debug!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, transformations = self.transformations.len(), "starting transformer stage");
+
+        for (idx, transform) in self.transformations.iter().enumerate() {
+            match transform {
+                crate::stages::Transformation::Rename { from, to } => {
+                    debug!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, idx = idx, from = %from, to = %to, "renaming field");
+                    transform.apply(&mut msg, ctx)?;
+                    info!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, from = %from, to = %to, "field renamed");
+                }
+                crate::stages::Transformation::Convert { field, .. } => {
+                    debug!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, idx = idx, field = %field, "converting field");
+                    transform.apply(&mut msg, ctx)?;
+                    if let Some(converted_val) = msg.get(field) {
+                        info!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, field = %field, value = %converted_val, "field converted");
+                    }
+                }
+                _ => {
+                    transform.apply(&mut msg, ctx)?;
+                }
+            }
         }
+
+        info!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, "transformer stage completed");
         Ok(StageResult::Continue(msg))
     }
 

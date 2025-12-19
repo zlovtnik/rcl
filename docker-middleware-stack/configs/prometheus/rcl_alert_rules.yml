@@ -94,7 +94,7 @@ groups:
           description: "Message throughput has dropped below 100 messages/sec"
 
       - alert: NoMessages
-        expr: increase(messages_total[5m]) == 0
+        expr: increase(messages_total[5m]) <= 0
         for: 5m
         labels:
           severity: warning
