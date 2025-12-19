@@ -212,10 +212,31 @@ pub struct TransformerStage {
 
 #[derive(Clone, Debug)]
 enum Transformation {
-    Rename { from: String, to: String },
-    Convert { field: String, converter: Converter },
-    AddField { name: String, value: ValueGenerator },
-    RemoveField { name: String },
+    Rename {
+        from: String,
+        to: String,
+    },
+    Convert {
+        field: String,
+        converter: Converter,
+    },
+    AddField {
+        name: String,
+        value: ValueGenerator,
+    },
+    RemoveField {
+        name: String,
+    },
+    Flatten {
+        field: String,
+        prefix: Option<String>,
+    },
+    Script {
+        #[allow(dead_code)]
+        engine: ScriptEngine,
+        #[allow(dead_code)]
+        code: String,
+    },
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -224,6 +245,13 @@ enum Converter {
     ToDecimal,
     ToInteger,
     ToString,
+    UnixToIso8601,
+    Iso8601ToUnix,
+}
+
+#[derive(Clone, Debug)]
+enum ScriptEngine {
+    Rhai,
 }
 
 #[derive(Clone, Debug)]
@@ -285,6 +313,8 @@ impl TransformerStage {
                     "decimal" => Converter::ToDecimal,
                     "integer" => Converter::ToInteger,
                     "string" => Converter::ToString,
+                    "unix_to_iso8601" => Converter::UnixToIso8601,
+                    "iso8601_to_unix" => Converter::Iso8601ToUnix,
                     other => return Err(anyhow::anyhow!("unknown converter: {}", other)),
                 };
                 Ok(Transformation::Convert { field, converter })
@@ -311,6 +341,34 @@ impl TransformerStage {
                     .ok_or_else(|| anyhow::anyhow!("missing name in remove_field"))?
                     .to_string();
                 Ok(Transformation::RemoveField { name })
+            }
+            "flatten" => {
+                let field = config
+                    .get("field")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("missing field in flatten"))?
+                    .to_string();
+                let prefix = config
+                    .get("prefix")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                Ok(Transformation::Flatten { field, prefix })
+            }
+            "script" => {
+                let engine_str = config
+                    .get("engine")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("rhai");
+                let engine = match engine_str {
+                    "rhai" => ScriptEngine::Rhai,
+                    other => return Err(anyhow::anyhow!("unsupported script engine: {}", other)),
+                };
+                let code = config
+                    .get("code")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("missing code in script"))?
+                    .to_string();
+                Ok(Transformation::Script { engine, code })
             }
             other => Err(anyhow::anyhow!("unknown transformation type: {}", other)),
         }
@@ -347,6 +405,28 @@ impl Transformation {
                 remove_field(msg, name).map_err(|e| {
                     ProcessingError::Stage(StageError::new("field_error", e.to_string()))
                 })?;
+            }
+            Transformation::Flatten { field, prefix } => {
+                if let Some(Value::Object(obj)) = remove_field(msg, field).map_err(|e| {
+                    ProcessingError::Stage(StageError::new("field_error", e.to_string()))
+                })? {
+                    for (k, v) in obj {
+                        let new_key = if let Some(p) = prefix {
+                            format!("{}{}", p, k)
+                        } else {
+                            k
+                        };
+                        set_field(msg, &new_key, v).map_err(|e| {
+                            ProcessingError::Stage(StageError::new("field_error", e.to_string()))
+                        })?;
+                    }
+                }
+            }
+            Transformation::Script { .. } => {
+                return Err(ProcessingError::Stage(StageError::new(
+                    "not_implemented",
+                    "Scripting not supported yet",
+                )));
             }
         }
         Ok(())
@@ -429,6 +509,51 @@ impl Converter {
                 }
             }
             Converter::ToString => Ok(Value::String(value.to_string())),
+            Converter::UnixToIso8601 => {
+                let ts = match value {
+                    Value::Number(n) => n.as_i64().ok_or_else(|| {
+                        ProcessingError::Stage(StageError::new(
+                            "conversion_error",
+                            "Invalid unix timestamp",
+                        ))
+                    })?,
+                    Value::String(s) => s.parse::<i64>().map_err(|e| {
+                        ProcessingError::Stage(StageError::new(
+                            "conversion_error",
+                            format!("Parse unix timestamp error: {}", e),
+                        ))
+                    })?,
+                    _ => {
+                        return Err(ProcessingError::Stage(StageError::new(
+                            "conversion_error",
+                            "cannot convert to iso8601",
+                        )));
+                    }
+                };
+                let dt = chrono::DateTime::from_timestamp(ts, 0).ok_or_else(|| {
+                    ProcessingError::Stage(StageError::new(
+                        "conversion_error",
+                        "Invalid unix timestamp",
+                    ))
+                })?;
+                Ok(Value::String(dt.to_rfc3339()))
+            }
+            Converter::Iso8601ToUnix => {
+                if let Value::String(s) = value {
+                    let dt = chrono::DateTime::parse_from_rfc3339(&s).map_err(|e| {
+                        ProcessingError::Stage(StageError::new(
+                            "conversion_error",
+                            format!("Parse iso8601 error: {}", e),
+                        ))
+                    })?;
+                    Ok(Value::Number(serde_json::Number::from(dt.timestamp())))
+                } else {
+                    Err(ProcessingError::Stage(StageError::new(
+                        "conversion_error",
+                        "cannot convert to unix timestamp",
+                    )))
+                }
+            }
         }
     }
 }
@@ -687,7 +812,7 @@ fn set_field(value: &mut Value, field: &str, new_value: Value) -> Result<()> {
     for (i, part) in parts.iter().enumerate() {
         if i == parts.len() - 1 {
             // Last part, set the value
-            if let Value::Object(ref mut map) = current {
+            if let Value::Object(map) = current {
                 map.insert((*part).to_string(), new_value_opt.take().unwrap());
             } else {
                 return Err(anyhow::anyhow!("cannot set field on non-object"));
@@ -699,8 +824,9 @@ fn set_field(value: &mut Value, field: &str, new_value: Value) -> Result<()> {
                     "invalid path: cannot traverse through non-object at intermediate segment"
                 ));
             }
-            if let Value::Object(ref mut map) = current {
+            if let Value::Object(map) = current {
                 // Check if the key exists and is not an object
+                #[allow(clippy::collapsible_if)]
                 if let Some(existing) = map.get(*part) {
                     if !existing.is_object() {
                         return Err(anyhow::anyhow!(
@@ -730,14 +856,14 @@ fn remove_field(value: &mut Value, field: &str) -> Result<Option<Value>> {
     for (i, part) in parts.iter().enumerate() {
         if i == parts.len() - 1 {
             // Last part, remove the value
-            if let Value::Object(ref mut map) = current {
+            if let Value::Object(map) = current {
                 return Ok(map.remove(*part));
             } else {
                 return Ok(None);
             }
         } else {
             // Intermediate part
-            if let Value::Object(ref mut map) = current {
+            if let Value::Object(map) = current {
                 if let Some(next) = map.get_mut(*part) {
                     current = next;
                 } else {
@@ -752,7 +878,7 @@ fn remove_field(value: &mut Value, field: &str) -> Result<Option<Value>> {
 }
 
 fn merge_objects(mut base: Value, other: Value) -> Value {
-    if let (Value::Object(ref mut base_map), Value::Object(other_map)) = (&mut base, other) {
+    if let (Value::Object(base_map), Value::Object(other_map)) = (&mut base, other) {
         for (k, v) in other_map {
             base_map.insert(k, v);
         }
@@ -893,7 +1019,7 @@ impl IdempotentReceiverStage {
                 return Err(anyhow::anyhow!(
                     "unsupported storage type: {}",
                     storage_type
-                ))
+                ));
             }
         };
 
@@ -1344,10 +1470,12 @@ mod tests {
         });
         let result = FilterStage::from_config("test".to_string(), config);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("invalid filter mode"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid filter mode")
+        );
     }
 
     #[test]
@@ -1375,10 +1503,12 @@ mod tests {
         });
         let result = FilterStage::from_config("test".to_string(), config);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("missing conditions"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("missing conditions")
+        );
     }
 
     #[test]
@@ -1410,10 +1540,12 @@ mod tests {
         });
         let result = FilterStage::from_config("test".to_string(), config);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("no valid operator"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no valid operator")
+        );
     }
 
     #[test]

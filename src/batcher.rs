@@ -67,9 +67,9 @@ impl BatcherConfig {
     /// - `flush_interval_ms` = 5000 ms,
     /// - `max_batch_size` from `postgres.copy_batch_rows`,
     /// - `max_batch_bytes` = 10_485_760 bytes,
-    /// and maps adaptive batching fields from `pipeline.batching` (`adaptive_enabled`, `min_batch_size`,
-    /// `max_batch_size`, `latency_window_size`, `latency_target_ms`). The provided `shutdown_timeout` is used
-    /// verbatim.
+    ///   and maps adaptive batching fields from `pipeline.batching` (`adaptive_enabled`, `min_batch_size`,
+    ///   `max_batch_size`, `latency_window_size`, `latency_target_ms`). The provided `shutdown_timeout` is used
+    ///   verbatim.
     ///
     /// # Examples
     ///
@@ -173,7 +173,10 @@ impl PipelineBuffer {
         } else {
             serde_json::to_string(&message)
                 .map_err(|e| {
-                    ProcessingError::Validation(ValidationError::new(format!("json serialize: {}", e)))
+                    ProcessingError::Validation(ValidationError::new(format!(
+                        "json serialize: {}",
+                        e
+                    )))
                 })?
                 .len()
         };
@@ -381,7 +384,12 @@ impl Batcher {
             .entry(buffer_key.clone())
             .or_insert_with(|| PipelineBuffer::new(pipeline_name.to_string(), table.to_string()));
 
-        buffer.add_message(message, context, self.config.max_batch_bytes, Some(message_size))?;
+        buffer.add_message(
+            message,
+            context,
+            self.config.max_batch_bytes,
+            Some(message_size),
+        )?;
         self.metrics.batch_messages_total.inc();
 
         // Check if buffer should be flushed immediately after adding
@@ -662,6 +670,7 @@ impl Batcher {
     /// // let mut batcher = /* create batcher */ ;
     /// // tokio::spawn(async move { let _ = batcher.run_background_flush().await; });
     /// ```
+    #[allow(dead_code)]
     pub async fn run_background_flush(&mut self) -> Result<(), ProcessingError> {
         let mut interval = time::interval(Duration::from_millis(1000)); // Check every second
 
@@ -681,7 +690,7 @@ impl Batcher {
         Ok(())
     }
 
-    async fn flush_pending_buffers(&mut self) -> Result<(), ProcessingError> {
+    pub async fn flush_pending_buffers(&mut self) -> Result<(), ProcessingError> {
         let now = Instant::now();
 
         // Collect keys that need flushing and flush them immediately
@@ -701,14 +710,12 @@ impl Batcher {
         Ok(())
     }
 
-    async fn flush_all_buffers(&mut self, reason: FlushReason) -> Result<(), ProcessingError> {
+    pub async fn flush_all_buffers(&mut self, reason: FlushReason) -> Result<(), ProcessingError> {
         let buffer_keys: Vec<String> = self.buffers.keys().cloned().collect();
 
         for key in buffer_keys {
-            if let Some(mut buffer) = self.buffers.remove(&key) {
-                if !buffer.is_empty() {
-                    self.flush_buffer(&mut buffer, reason.clone()).await?;
-                }
+            if let Some(mut buffer) = self.buffers.remove(&key).filter(|b| !b.is_empty()) {
+                self.flush_buffer(&mut buffer, reason.clone()).await?;
             }
         }
 
@@ -783,6 +790,7 @@ mod tests {
             partition: 0,
             offset,
             timestamp: 1000,
+            retry_count: None,
         }
     }
 
@@ -830,7 +838,12 @@ mod tests {
         let mut buffer = PipelineBuffer::new("test-pipeline".to_string(), "test-table".to_string());
 
         buffer
-            .add_message(create_test_message(1), create_test_context(1), 10_485_760, None)
+            .add_message(
+                create_test_message(1),
+                create_test_context(1),
+                10_485_760,
+                None,
+            )
             .unwrap();
         assert!(!buffer.is_empty());
 
@@ -899,7 +912,12 @@ mod tests {
         for i in 1..3 {
             let msg = create_test_message(i);
             buffer
-                .add_message(msg, create_test_context(i as i64), config.max_batch_bytes, None)
+                .add_message(
+                    msg,
+                    create_test_context(i as i64),
+                    config.max_batch_bytes,
+                    None,
+                )
                 .unwrap();
         }
 
@@ -1022,10 +1040,8 @@ mod tests {
 
     #[test]
     fn test_multiple_buffers_isolation() {
-        let mut buffer1 =
-            PipelineBuffer::new("pipeline1".to_string(), "table1".to_string());
-        let mut buffer2 =
-            PipelineBuffer::new("pipeline2".to_string(), "table2".to_string());
+        let mut buffer1 = PipelineBuffer::new("pipeline1".to_string(), "table1".to_string());
+        let mut buffer2 = PipelineBuffer::new("pipeline2".to_string(), "table2".to_string());
 
         // Add different messages to each buffer
         let msg1 = create_test_message(1);
@@ -1058,7 +1074,7 @@ mod tests {
         let mut buffer = PipelineBuffer::new("test-pipeline".to_string(), "test-table".to_string());
         let mut size_config = create_test_config();
         size_config.max_batch_size = 2;
-        
+
         for i in 0..2 {
             buffer
                 .add_message(
@@ -1080,12 +1096,17 @@ mod tests {
         let time_config = create_test_config();
         let msg = create_test_message(1);
         buffer
-            .add_message(msg, create_test_context(1), time_config.max_batch_bytes, None)
+            .add_message(
+                msg,
+                create_test_context(1),
+                time_config.max_batch_bytes,
+                None,
+            )
             .unwrap();
-        
+
         let first_time = buffer.first_message_time.unwrap();
         let far_future = first_time + Duration::from_millis(time_config.flush_interval_ms + 1);
-        
+
         assert_eq!(
             buffer.should_flush(&time_config, far_future),
             Some(FlushReason::Time),
@@ -1105,10 +1126,9 @@ mod tests {
                 partition: i as i32,
                 offset: (i * 100) as i64,
                 timestamp: 1000 + i as i64,
+                retry_count: None,
             };
-            buffer
-                .add_message(msg, ctx, 10_485_760, None)
-                .unwrap();
+            buffer.add_message(msg, ctx, 10_485_760, None).unwrap();
         }
 
         // Verify contexts are preserved in order
@@ -1140,12 +1160,22 @@ mod tests {
         let size2 = serde_json::to_string(&msg2).unwrap().len();
 
         buffer
-            .add_message(msg1.clone(), create_test_context(1), 10_485_760, Some(size1))
+            .add_message(
+                msg1.clone(),
+                create_test_context(1),
+                10_485_760,
+                Some(size1),
+            )
             .unwrap();
         assert_eq!(buffer.current_bytes, size1);
 
         buffer
-            .add_message(msg2.clone(), create_test_context(2), 10_485_760, Some(size2))
+            .add_message(
+                msg2.clone(),
+                create_test_context(2),
+                10_485_760,
+                Some(size2),
+            )
             .unwrap();
         assert_eq!(buffer.current_bytes, size1 + size2);
     }
@@ -1165,12 +1195,7 @@ mod tests {
 
         // Add with precomputed size
         buffer
-            .add_message(
-                msg,
-                create_test_context(1),
-                10_485_760,
-                Some(expected_size),
-            )
+            .add_message(msg, create_test_context(1), 10_485_760, Some(expected_size))
             .unwrap();
 
         // Verify byte count matches precomputed value
@@ -1235,7 +1260,7 @@ mod tests {
     #[test]
     fn test_buffer_timestamps_on_first_message() {
         let mut buffer = PipelineBuffer::new("test-pipeline".to_string(), "test-table".to_string());
-        
+
         assert!(buffer.first_message_time.is_none());
 
         let msg = create_test_message(1);

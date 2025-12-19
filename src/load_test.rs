@@ -36,11 +36,13 @@ pub async fn run(cfg: Config, rate: u32, duration_sec: u64) -> Result<()> {
         interval_timer.tick().await;
 
         let payload = serde_json::json!({
-            "op": "c",
-            "after": {
-                "id": count,
-                "data": "synthetic-data",
-                "ts": chrono::Utc::now().to_rfc3339()
+            "payload": {
+                "op": "c",
+                "after": {
+                    "id": count,
+                    "data": "synthetic-data",
+                    "ts": chrono::Utc::now().to_rfc3339()
+                }
             }
         })
         .to_string();
@@ -99,7 +101,9 @@ mod tests {
                 copy_enabled: false,
                 copy_batch_rows: 1000,
                 insert_batch_rows: 100,
+                enable_offset_tracking: false,
             },
+            retry: crate::retry::RetryConfig::default(),
             pipelines,
         }
     }

@@ -1,16 +1,16 @@
 {
   "service": {
-    "log_level": "info",
+    "log_level": "debug",
     "metrics_port": 9091,
     "otlp_endpoint": "http://localhost:4317",
     "health_check_timeout_ms": 5000,
     "shutdown_timeout_ms": 30000,
-    "batch_flush_interval_ms": 5000,
+    "batch_flush_interval_ms": 100,
     "batch_max_bytes": 10485760
   },
   "kafka": {
     "brokers": "localhost:9092",
-    "group_id": "rcl-consumer-group",
+    "group_id": "rcl-consumer-group-debug-1",
     "session_timeout_ms": 45000,
     "max_inflight_messages": 500,
     "producer_retries": 5,
@@ -20,10 +20,11 @@
   },
   "postgres": {
     "url": "postgresql://rcl:rcl@localhost:5432/warehouse",
+    "ssl_mode": "disable",
     "copy_enabled": true,
-    "copy_batch_rows": 5000,
-    "insert_batch_rows": 500,
-    "enable_offset_tracking": false,
+    "copy_batch_rows": 1,
+    "insert_batch_rows": 1,
+    "enable_offset_tracking": true,
     "pool": {
       "max_connections": 10,
       "acquire_timeout_ms": 5000
@@ -31,11 +32,11 @@
   },
   "pipelines": [
     {
-      "name": "orders_pipeline",
-      "topic": "cdc.orders2",
+      "name": "example_pipeline",
+      "topic": "cdc.example",
       "debezium_envelope": true,
       "staging_table": "stg_orders",
-      "required_fields": ["id"],
+      "required_fields": [],
       "backpressure": {
         "channel_capacity": 20000
       },
@@ -47,32 +48,16 @@
         "half_open_timeout_ms": 30000
       },
       "dlq": {
-        "topic": "dlq.orders",
+        "topic": "dlq.example",
         "max_retries": 3,
         "max_payload_bytes": 1048576
       },
       "stages": [
         {
           "type": "transformer",
-          "name": "enrich_data",
+          "name": "pass_through",
           "config": {
-            "transformations": [
-              {
-                "type": "rename",
-                "from": "id",
-                "to": "order_id"
-              },
-              {
-                "type": "rename",
-                "from": "ts",
-                "to": "event_timestamp"
-              },
-              {
-                "type": "convert",
-                "field": "event_timestamp",
-                "converter": "iso8601_to_unix"
-              }
-            ]
+            "operations": []
           }
         }
       ]

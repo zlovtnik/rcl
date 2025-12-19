@@ -5,10 +5,10 @@ use crate::types::MessageContext;
 use anyhow::Result;
 use chrono::Utc;
 use futures::StreamExt;
+use rdkafka::Message;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
-use rdkafka::Message;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fs::File;
@@ -17,6 +17,11 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 const MAX_DLQ_PREVIEW_BYTES: usize = 4_096;
+// Kafka default message.max.bytes is 1048576 (1MB). We use 90% to be safe.
+const MAX_KAFKA_MESSAGE_BYTES: usize = 943_718; // 90% of 1MB
+const HEADER_BUDGET_BYTES: usize = 1024; // Reserve 1KB for headers
+const MAX_TRUNCATION_ATTEMPTS: usize = 5;
+const TRUNCATION_REDUCTION_FACTOR: f64 = 0.8; // More aggressive (80%) for better convergence with JSON overhead
 
 async fn wait_for_kafka_readiness(
     consumer: &StreamConsumer,
@@ -52,6 +57,8 @@ pub fn build_producer(cfg: &KafkaConfig) -> Result<FutureProducer> {
         .set("retries", cfg.producer_retries.to_string())
         .set("compression.type", &cfg.compression)
         .set("message.timeout.ms", cfg.dlq_message_timeout_ms.to_string())
+        // Limit message size to 1MB (Kafka default)
+        .set("message.max.bytes", "1048576")
         .create()?;
     Ok(producer)
 }
@@ -83,22 +90,120 @@ pub async fn publish(
     ctx: &MessageContext,
     reason: &ProcessingError,
     raw_payload: &str,
+    retry_count: Option<u32>,
 ) -> Result<()> {
     let correlation = ctx.correlation_id();
     let public_reason = reason.public_reason();
     let timestamp = Utc::now().to_rfc3339();
-    let retry_count = "0";
+    let retry_count_str = retry_count.unwrap_or(0).to_string();
     let original_size = raw_payload.len();
-    let (payload, truncated) =
-        sanitize_payload(raw_payload, original_size, dlq_cfg.max_payload_bytes);
-    let body = serde_json::to_string(&DlqPayload {
-        context: ctx,
-        reason: public_reason.clone(),
-        pipeline: pipeline_name,
-        payload,
-        original_size,
-        truncated,
-    })?;
+    
+    // Quick estimate: if raw payload alone is close to Kafka limit, we'll likely need iterative truncation
+    // Rough budget estimate: overhead + payload + headers. If raw payload approaches this, skip initial sanitization.
+    let rough_max_for_payload = MAX_KAFKA_MESSAGE_BYTES.saturating_sub(HEADER_BUDGET_BYTES).saturating_sub(500);
+    let needs_iterative_truncation = original_size > rough_max_for_payload;
+    
+    // If we don't need iterative truncation, do normal flow with initial sanitization
+    let body = if !needs_iterative_truncation {
+        let (payload, truncated) =
+            sanitize_payload(raw_payload, original_size, dlq_cfg.max_payload_bytes);
+        let body_str = serde_json::to_string(&DlqPayload {
+            context: ctx,
+            reason: public_reason.clone(),
+            pipeline: pipeline_name,
+            payload,
+            original_size,
+            truncated,
+        })?;
+        
+        // Double-check: if even this is over limit, fall through to iterative truncation
+        if body_str.len() > MAX_KAFKA_MESSAGE_BYTES {
+            None
+        } else {
+            Some(body_str)
+        }
+    } else {
+        None
+    };
+
+    // Validate message size before sending to Kafka
+    let body = if let Some(body) = body {
+        body
+    } else {
+        warn!(
+            topic = %dlq_cfg.topic,
+            message_size = if let Some(b) = &body { b.len() } else { original_size },
+            max_size = MAX_KAFKA_MESSAGE_BYTES,
+            correlation = %correlation,
+            "DLQ message exceeds Kafka max size limit, attempting iterative truncation"
+        );
+
+        // 1. Measure overhead with empty payload
+        let overhead_payload = DlqPayload {
+            context: ctx,
+            reason: public_reason.clone(),
+            pipeline: pipeline_name,
+            payload: Cow::Borrowed(""),
+            original_size,
+            truncated: true,
+        };
+        let overhead_size = serde_json::to_string(&overhead_payload)?.len();
+
+        // 2. Compute initial target payload size
+        let mut target_payload_size = MAX_KAFKA_MESSAGE_BYTES
+            .saturating_sub(overhead_size)
+            .saturating_sub(HEADER_BUDGET_BYTES);
+
+        let mut final_body = None;
+
+        for attempt in 0..MAX_TRUNCATION_ATTEMPTS {
+            // 3. Sanitize with current target
+            let (smaller_payload, was_truncated) =
+                sanitize_payload(raw_payload, original_size, target_payload_size);
+
+            let new_body = serde_json::to_string(&DlqPayload {
+                context: ctx,
+                reason: public_reason.clone(),
+                pipeline: pipeline_name,
+                payload: smaller_payload,
+                original_size,
+                truncated: was_truncated,
+            })?;
+
+            if new_body.len() <= MAX_KAFKA_MESSAGE_BYTES {
+                final_body = Some(new_body);
+                break;
+            }
+
+            // Calculate exact overage and reduce proportionally for better convergence
+            let overage = new_body.len().saturating_sub(MAX_KAFKA_MESSAGE_BYTES);
+            let reduction_factor = if overage > 0 {
+                // Aggressive proportional reduction: if 20% over, reduce by at least 25%
+                let overage_ratio = overage as f64 / new_body.len() as f64;
+                (1.0 - overage_ratio * 1.25).max(0.6) // Ensure we reduce significantly, but not too much
+            } else {
+                TRUNCATION_REDUCTION_FACTOR
+            };
+            
+            target_payload_size = (target_payload_size as f64 * reduction_factor) as usize;
+
+            warn!(
+                attempt = attempt + 1,
+                current_size = new_body.len(),
+                overage_bytes = overage,
+                target_payload = target_payload_size,
+                "Truncation attempt failed, retrying with smaller payload budget"
+            );
+        }
+
+        final_body.ok_or_else(|| {
+            anyhow::anyhow!(
+                "DLQ message size exceeds Kafka limit {} after {} truncation attempts",
+                MAX_KAFKA_MESSAGE_BYTES,
+                MAX_TRUNCATION_ATTEMPTS
+            )
+        })?
+    };
 
     let headers = OwnedHeaders::new()
         .insert(Header {
@@ -111,7 +216,7 @@ pub async fn publish(
         })
         .insert(Header {
             key: "retry_count",
-            value: Some(retry_count.as_bytes()),
+            value: Some(retry_count_str.as_bytes()),
         })
         .insert(Header {
             key: "original_topic",
@@ -382,7 +487,7 @@ mod tests {
     fn test_truncate_utf8_multibyte() {
         // 'é' is two bytes in UTF-8; ensure we don't cut in the middle
         let s = "aébc"; // bytes: a (1) é (2) b (1) c (1)
-                        // limit 2 bytes should only include 'a'
+        // limit 2 bytes should only include 'a'
         assert_eq!(truncate_utf8(s, 2), "a");
         // limit 3 bytes should include 'a' and 'é'
         assert_eq!(truncate_utf8(s, 3), "aé");
@@ -407,7 +512,7 @@ mod tests {
 
     #[test]
     fn test_dlq_payload_serialize() {
-        let ctx = MessageContext::new("topic-a".to_string(), 1, 2, 3);
+        let ctx = MessageContext::new("topic-a".to_string(), 1, 2, 3, None);
         let reason = crate::errors::ProcessingError::Validation(
             crate::errors::ValidationError::new("bad".to_string()),
         );
@@ -439,7 +544,7 @@ mod tests {
     fn test_truncate_utf8_emoji_and_boundaries() {
         // emoji are 4 bytes; ensure truncation doesn't cut them
         let s = "a🙂b"; // a (1) 🙂 (4) b (1)
-                        // limit 2 bytes -> only 'a'
+        // limit 2 bytes -> only 'a'
         assert_eq!(truncate_utf8(s, 2), "a");
         // limit 5 bytes -> include emoji
         assert_eq!(truncate_utf8(s, 5), "a🙂");
@@ -502,7 +607,7 @@ mod tests {
 
     #[test]
     fn test_dlq_payload_serialization() {
-        let ctx = MessageContext::new("topic".to_string(), 0, 42, 123);
+        let ctx = MessageContext::new("topic".to_string(), 0, 42, 123, None);
         let reason = crate::errors::PublicErrorReason {
             code: "ERR001".to_string(),
             message: "test error".to_string(),
@@ -525,7 +630,7 @@ mod tests {
 
     #[test]
     fn test_dlq_payload_truncated_flag() {
-        let ctx = MessageContext::new("topic".to_string(), 0, 42, 123);
+        let ctx = MessageContext::new("topic".to_string(), 0, 42, 123, None);
         let reason = crate::errors::PublicErrorReason {
             code: "ERR001".to_string(),
             message: "test error".to_string(),

@@ -79,7 +79,7 @@ impl StageError {
 pub trait Stage: Send + Sync {
     /// Process a message through this stage
     async fn process(&self, ctx: &StageContext, msg: Value)
-        -> Result<StageResult, ProcessingError>;
+    -> Result<StageResult, ProcessingError>;
 
     /// Stage name for metrics/logging
     #[allow(dead_code)]
@@ -294,6 +294,38 @@ pub struct PipelineConfig {
     pub backpressure: BackpressureConfig,
     #[serde(default)]
     pub batching: BatchingConfig,
+    /// Circuit breaker configuration for fault tolerance.
+    ///
+    /// Controls the behavior of the circuit breaker mechanism, which protects the pipeline from cascading failures.
+    /// The circuit breaker operates in three states: Closed (normal operation), Open (fast-fail to prevent overload),
+    /// and Half-Open (testing recovery). See [`crate::circuit_breaker::CircuitBreakerConfig`] for state details,
+    /// failure/success thresholds, and recovery timeout settings.
+    ///
+    /// # Default Behavior
+    ///
+    /// If not specified, uses [`CircuitBreakerConfig::default`] with: enabled=true, failure_threshold=10,
+    /// success_threshold=5, half_open_timeout_ms=30000.
+    #[serde(default)]
+    pub circuit_breaker: crate::circuit_breaker::CircuitBreakerConfig,
+    /// Number of concurrent worker threads for pipeline message processing.
+    ///
+    /// Controls the parallelism level for processing messages through this pipeline:
+    /// - **1 (default)**: Sequential processing, strict per-partition ordering preserved.
+    /// - **>1**: Parallel message processing with specified thread count. Note: ordering across messages
+    ///   in the same partition is NOT guaranteed with multiple threads (messages are distributed via round-robin).
+    ///   Use this for throughput optimization when ordering is not critical.
+    ///
+    /// # Valid Range
+    ///
+    /// Must be >= 1 (0 or negative values are rejected during config validation).
+    /// **Recommended values:** 1–8 for most use cases; larger values (8–16) for high-throughput scenarios
+    /// with external ordering mechanisms or when key-based sharding is implemented upstream.
+    ///
+    /// # Default
+    ///
+    /// 1 (sequential processing, total ordering preserved).
+    #[serde(default = "PipelineConfig::default_worker_threads")]
+    pub worker_threads: usize,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -315,6 +347,14 @@ impl BackpressureConfig {
 
     pub fn default_channel_capacity() -> usize {
         Self::DEFAULT_CHANNEL_CAPACITY
+    }
+}
+
+impl PipelineConfig {
+    pub const DEFAULT_WORKER_THREADS: usize = 1;
+
+    pub fn default_worker_threads() -> usize {
+        Self::DEFAULT_WORKER_THREADS
     }
 }
 
@@ -507,6 +547,8 @@ mod tests {
                 channel_capacity: 100,
             },
             batching: Default::default(),
+            circuit_breaker: Default::default(),
+            worker_threads: 1,
         };
 
         let pipeline = Pipeline::from_config(&config).unwrap();
@@ -548,6 +590,8 @@ mod tests {
                 channel_capacity: 100,
             },
             batching: Default::default(),
+            circuit_breaker: Default::default(),
+            worker_threads: 1,
         };
 
         let pipeline = Pipeline::from_config(&config).unwrap();
@@ -602,6 +646,8 @@ mod tests {
                 channel_capacity: 100,
             },
             batching: Default::default(),
+            circuit_breaker: Default::default(),
+            worker_threads: 1,
         };
 
         let pipeline = Pipeline::from_config(&config).unwrap();
@@ -657,6 +703,8 @@ mod tests {
                 channel_capacity: 100,
             },
             batching: Default::default(),
+            circuit_breaker: Default::default(),
+            worker_threads: 1,
         };
 
         let pipeline = Pipeline::from_config(&config).unwrap();
@@ -734,6 +782,8 @@ mod tests {
                 channel_capacity: 100,
             },
             batching: Default::default(),
+            circuit_breaker: Default::default(),
+            worker_threads: 1,
         };
 
         let original_pipeline = Pipeline::from_config(&config).unwrap();
@@ -873,6 +923,8 @@ mod tests {
                 channel_capacity: 100,
             },
             batching: Default::default(),
+            circuit_breaker: Default::default(),
+            worker_threads: 1,
         };
 
         // Manually create a pipeline with our error stage
@@ -917,6 +969,8 @@ mod tests {
                 channel_capacity: 100,
             },
             batching: Default::default(),
+            circuit_breaker: Default::default(),
+            worker_threads: 1,
         };
 
         let pipeline = Pipeline::from_config(&config).unwrap();

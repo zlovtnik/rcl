@@ -57,16 +57,25 @@ pub struct MessageContext {
     pub partition: i32,
     pub offset: i64,
     pub timestamp: i64,
+    #[serde(default)]
+    pub retry_count: Option<u32>,
 }
 
 impl MessageContext {
     #[allow(dead_code)]
-    pub fn new(topic: String, partition: i32, offset: i64, timestamp: i64) -> Self {
+    pub fn new(
+        topic: String,
+        partition: i32,
+        offset: i64,
+        timestamp: i64,
+        retry_count: Option<u32>,
+    ) -> Self {
         Self {
             topic,
             partition,
             offset,
             timestamp,
+            retry_count,
         }
     }
 
@@ -110,7 +119,7 @@ mod tests {
 
     #[test]
     fn test_message_context_correlation_id() {
-        let ctx = MessageContext::new("topic".to_string(), 1, 42, 0);
+        let ctx = MessageContext::new("topic".to_string(), 1, 42, 0, None);
         assert_eq!(ctx.correlation_id(), "topic:1:42");
     }
 }

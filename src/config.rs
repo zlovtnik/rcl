@@ -1,5 +1,7 @@
+#![allow(clippy::collapsible_if)]
 use crate::eip::PipelineConfig;
-use anyhow::{bail, ensure, Context, Result};
+use crate::retry::RetryConfig;
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
@@ -190,12 +192,13 @@ mod tests {
             ssl_mode: None,
             ssl_root_cert: None,
             pool: Some(PostgresPoolConfig {
-                max_connections: 20,
-                acquire_timeout_ms: 10000,
+                max_connections: 10,
+                acquire_timeout_ms: 5000,
             }),
             copy_enabled: true,
             copy_batch_rows: 1000,
             insert_batch_rows: 100,
+            enable_offset_tracking: false,
         };
         assert!(cfg.validate().is_ok());
     }
@@ -213,6 +216,7 @@ mod tests {
             copy_enabled: true,
             copy_batch_rows: 1000,
             insert_batch_rows: 100,
+            enable_offset_tracking: false,
         };
         assert!(cfg.validate().is_err());
     }
@@ -504,7 +508,9 @@ mod tests {
                 copy_enabled: true,
                 copy_batch_rows: 5000,
                 insert_batch_rows: 500,
+                enable_offset_tracking: false,
             },
+            retry: RetryConfig::default(),
             pipelines: vec![PipelineConfig {
                 name: "test-pipeline".to_string(),
                 topic: "test-topic".to_string(),
@@ -517,6 +523,8 @@ mod tests {
                     channel_capacity: 20000,
                 },
                 batching: Default::default(),
+                circuit_breaker: Default::default(),
+                worker_threads: 1,
             }],
         }
     }
@@ -604,6 +612,30 @@ pub struct PostgresConfig {
     pub copy_enabled: bool,
     pub copy_batch_rows: usize,
     pub insert_batch_rows: usize,
+    /// Enable offset tracking for exactly-once semantics (default: false).
+    ///
+    /// When enabled, the application persists Kafka partition offsets to the database alongside
+    /// data writes, enabling recovery from the last successfully processed offset on restart.
+    /// This provides exactly-once delivery guarantees by tracking progress per (pipeline, topic, partition).
+    ///
+    /// **When to enable:**
+    /// - Require exactly-once semantics and cannot tolerate message replay on crash/restart
+    /// - Using long-running pipelines with potential recovery scenarios
+    /// - Need to preserve offset state across service restarts
+    ///
+    /// **Performance implications:**
+    /// - Minimal CPU overhead (single SQL insert/update per batch)
+    /// - Database disk I/O: Additional writes to offset_tracker table (1 row per partition per flush)
+    /// - Memory: Negligible (offset_tracker maintains minimal state per pipeline)
+    /// - Network: Single extra request per flush (batched with data writes in same transaction)
+    ///
+    /// **Operational notes:**
+    /// - Requires offset_tracker table in Postgres database (created during init)
+    /// - Offsets persisted atomically with data writes (same transaction)
+    /// - If disabled: offsets tracked only in Kafka group state (at-least-once semantics)
+    /// - Query `SELECT * FROM offset_tracker` for debugging or monitoring offset state
+    #[serde(default)]
+    pub enable_offset_tracking: bool,
 }
 
 impl PostgresConfig {
@@ -620,6 +652,8 @@ pub struct Config {
     pub service: ServiceConfig,
     pub kafka: KafkaConfig,
     pub postgres: PostgresConfig,
+    #[serde(default)]
+    pub retry: RetryConfig,
     pub pipelines: Vec<PipelineConfig>,
 }
 
@@ -683,6 +717,12 @@ impl Config {
 
     fn validate(&self) -> Result<()> {
         self.postgres.validate()?;
+
+        // Validate retry configuration
+        self.retry
+            .validate()
+            .map_err(|e| anyhow::anyhow!(e))
+            .context("retry config invalid")?;
 
         ensure!(
             self.service.metrics_port > 0,
@@ -830,12 +870,16 @@ pub fn validate_table_identifier(table: &str) -> Result<&str> {
     }
 
     if !valid_part(first) {
-        bail!("staging_table must start with a letter or underscore, contain only alphanumerics/underscores, and be <= 63 characters");
+        bail!(
+            "staging_table must start with a letter or underscore, contain only alphanumerics/underscores, and be <= 63 characters"
+        );
     }
 
     if let Some(schema_or_table) = second {
         if !valid_part(schema_or_table) {
-            bail!("staging_table schema/table parts must start with a letter or underscore, contain only alphanumerics/underscores, and be <= 63 characters");
+            bail!(
+                "staging_table schema/table parts must start with a letter or underscore, contain only alphanumerics/underscores, and be <= 63 characters"
+            );
         }
     }
 

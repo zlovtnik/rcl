@@ -1732,6 +1732,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "parking_lot",
  "percent-encoding",
  "prometheus",
  "rdkafka",

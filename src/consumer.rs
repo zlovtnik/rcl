@@ -1,4 +1,5 @@
-use crate::batcher::{Batcher, BatcherConfig};
+use crate::batcher::{Batcher, BatcherConfig, FlushReason};
+use crate::circuit_breaker::CircuitBreaker;
 use crate::config::{Config, KafkaConfig};
 use crate::decoder::decode_and_validate;
 use crate::dlq;
@@ -6,283 +7,74 @@ use crate::eip::{MessageMetadata, Pipeline, StageContext};
 use crate::errors::{ProcessingError, ValidationError};
 use crate::health::{ComponentStatus, HealthRegistry};
 use crate::metrics::Metrics;
+use crate::offset_tracker::OffsetTracker;
 use crate::shutdown::ShutdownCoordinator;
 use crate::types::MessageContext;
 use crate::writer::Writer;
 use anyhow::Result;
 use futures::StreamExt;
+use rdkafka::Message;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::OwnedMessage;
+use rdkafka::message::Headers;
 use rdkafka::producer::FutureProducer;
-use rdkafka::Message;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc};
-use tokio::time::{interval, Duration};
+use tokio::time::{Duration, interval};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 
 use rdkafka::Offset;
 use rdkafka::TopicPartitionList;
+use rdkafka::message::BorrowedHeaders;
 
-struct ConsumerContext {
-    consumer: Arc<StreamConsumer>,
-    batcher: Option<Arc<tokio::sync::Mutex<Batcher>>>,
-    metrics: Metrics,
-    health: Arc<HealthRegistry>,
-    pipelines_by_topic: HashMap<String, Pipeline>,
-    producer: Option<FutureProducer>,
-}
-
-impl ConsumerContext {
-    /// Enqueues a processed message and its context into the batcher for the specified pipeline and table.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` if the message was accepted into the batcher, `Err(ProcessingError)` if adding failed.
-    async fn add_to_batcher(
-        &self,
-        pipeline_name: &str,
-        table: &str,
-        message: Value,
-        context: &MessageContext,
-    ) -> Result<(), ProcessingError> {
-        let batcher = self.batcher.as_ref()
-            .ok_or_else(|| ProcessingError::Validation(ValidationError::new("batcher not available".to_string())))?;
-        let mut batcher_guard = batcher.lock().await;
-        batcher_guard
-            .add_message(pipeline_name, table, message, context.clone())
-            .await
-    }
-
-    /// Commit the consumer offset for the provided message context.
-    ///
-    /// This will attempt to commit the next offset (message offset + 1) for the topic and partition
-    /// described by `ctx`. On a commit failure the `processing_failures` metric is incremented and a
-    /// warning is logged; on success an informational log is emitted.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use tokio::runtime::Runtime;
-    /// # async fn _example(consumer_ctx: &crate::consumer::ConsumerContext, ctx: crate::consumer::MessageContext) {
-    /// consumer_ctx.commit_offset(&ctx).await;
-    /// # }
-    /// # let _ = Runtime::new().unwrap();
-    /// ```
-    async fn commit_offset(&self, ctx: &MessageContext) {
-        let mut tpl = TopicPartitionList::new();
-        if let Err(e) =
-            tpl.add_partition_offset(&ctx.topic, ctx.partition, Offset::Offset(ctx.offset + 1))
-        {
-            warn!("Failed to add partition offset to list: {}", e);
-            return;
-        }
-        if let Err(e) = self.consumer.commit(&tpl, CommitMode::Async) {
-            self.metrics.processing_failures.inc();
-            warn!(context = %ctx.correlation_id(), error = %e, "offset commit failed");
-        } else {
-            info!(context = %ctx.correlation_id(), "committed offset for failed message");
-        }
-    }
-
-    /// Handle a message decoding failure for a pipeline and finalize the message offset.
-    ///
-    /// This updates the pipeline error status in the health registry with `error_msg`, increments the `decode_failures` metric, logs a warning containing the message correlation id and error text, and commits the message offset from `ctx`.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # async fn example(ctx: &ConsumerContext, pipeline: &Pipeline, msg_ctx: &MessageContext) {
-    /// ctx.handle_decode_error(pipeline, msg_ctx, "invalid payload".to_string()).await;
-    /// # }
-    /// ```
-    async fn handle_decode_error(
-        &self,
-        pipeline: &Pipeline,
-        ctx: &MessageContext,
-        error_msg: String,
-    ) {
-        if let Err(err) = self
-            .health
-            .update_pipeline_error(&pipeline.name, error_msg.clone())
-        {
-            warn!("Failed to update pipeline error status: {}", err);
-        }
-        self.metrics.decode_failures.inc();
-        warn!(context = %ctx.correlation_id(), error = %error_msg, "decode error");
-        self.commit_offset(ctx).await;
-    }
-}
-
-impl ConsumerContext {
-    /// Process a single message payload through the given pipeline, enrich each resulting message with Kafka metadata, and enqueue the produced messages into the batcher.
-    ///
-    /// The payload is decoded and validated according to the pipeline configuration. If the decoded value is a JSON object, `_meta_topic`, `_meta_partition`, `_meta_offset`, and `_meta_ingest_ts` fields are injected from the provided message context. The pipeline is executed with a stage context derived from the message context; each produced message is routed to a destination table (from `_destination_table` or the pipeline staging table), validated, and added to the batcher.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` on success, `Err(ProcessingError)` if decoding/validation, pipeline execution, routing validation, or batching fails.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # async fn example(ctx: &crate::consumer::ConsumerContext, pipeline: &crate::pipeline::Pipeline) -> Result<(), crate::consumer::ProcessingError> {
-    /// let payload = r#"{"name":"alice"}"#;
-    /// ctx.process_message(payload, pipeline, &crate::consumer::MessageContext::default()).await?;
-    /// # Ok(()) }
-    /// ```
-    async fn process_message(
-        &self,
-        payload: &str,
-        pipeline: &Pipeline,
-        ctx: &MessageContext,
-    ) -> Result<(), ProcessingError> {
-        let mut decoded = decode_and_validate(payload.as_bytes(), &pipeline.config)?;
-
-        if let serde_json::Value::Object(ref mut map) = decoded {
-            map.insert(
-                "_meta_topic".to_string(),
-                serde_json::Value::String(ctx.topic.clone()),
-            );
-            map.insert(
-                "_meta_partition".to_string(),
-                serde_json::Value::Number(ctx.partition.into()),
-            );
-            map.insert(
-                "_meta_offset".to_string(),
-                serde_json::Value::Number(ctx.offset.into()),
-            );
-            map.insert(
-                "_meta_ingest_ts".to_string(),
-                serde_json::Value::Number(ctx.timestamp.into()),
-            );
-        }
-
-        // Execute EIP pipeline
-        let stage_ctx = StageContext {
-            correlation_id: ctx.correlation_id().to_string(),
-            pipeline_name: pipeline.name.clone(),
-            message_metadata: MessageMetadata::from_kafka(
-                ctx.topic.clone(),
-                ctx.partition,
-                ctx.offset,
-                Some(ctx.timestamp),
-            ),
-        };
-
-        let processed_messages = pipeline.execute(&stage_ctx, decoded).await?;
-
-        // Batch processed messages
-        for msg in processed_messages {
-            // Check for routing metadata
-            let candidate = msg
-                .get("_destination_table")
-                .and_then(|v| v.as_str())
-                .unwrap_or(&pipeline.config.staging_table);
-
-            let table = crate::config::validate_table_identifier(candidate)
-                .map_err(|e| ProcessingError::Validation(ValidationError::new(e.to_string())))?;
-
-            self.add_to_batcher(&pipeline.name, table, msg.clone(), ctx)
-                .await?;
-        }
-
-        Ok(())
-    }
-
-    /// Handle a processing error for a message by updating pipeline health, incrementing metrics,
-    /// attempting to publish the failed message to the pipeline's DLQ (if configured), and committing
-    /// the message offset so the consumer can advance.
-    ///
-    /// The method:
-    /// - records the pipeline error in the health registry (logs a warning if that update fails),
-    /// - increments the appropriate failure metric (`processing_failures` for transport errors,
-    ///   `decode_failures` otherwise),
-    /// - if a producer and DLQ configuration are available, attempts to publish the original payload
-    ///   and error details to the DLQ and increments `dlq_total` on success (logs on failure),
-    /// - if no DLQ is available, logs that the message was skipped,
-    /// - commits the message offset for the provided context.
-    ///
-    /// # Parameters
-    ///
-    /// - `pipeline`: the pipeline whose processing failed; used for health updates and DLQ routing.
-    /// - `ctx`: message context containing correlation id and metadata used for logging and commits.
-    /// - `reason`: the processing error that occurred; its public reason is used for logs and DLQ.
-    /// - `payload`: the original message payload as a string, forwarded to the DLQ when publishing.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # async fn example(
-    /// #     consumer_ctx: &crate::consumer::ConsumerContext,
-    /// #     pipeline: &crate::pipeline::Pipeline,
-    /// #     msg_ctx: &crate::consumer::MessageContext,
-    /// #     err: &crate::consumer::ProcessingError,
-    /// # ) {
-    /// consumer_ctx
-    ///     .handle_processing_error(pipeline, msg_ctx, err, "original payload")
-    ///     .await;
-    /// # }
-    /// ```
-    async fn handle_processing_error(
-        &self,
-        pipeline: &Pipeline,
-        ctx: &MessageContext,
-        reason: &ProcessingError,
-        payload: &str,
-    ) {
-        if let Err(err) = self
-            .health
-            .update_pipeline_error(&pipeline.name, reason.to_string())
-        {
-            warn!("Failed to update pipeline error status: {}", err);
-        }
-
-        match reason {
-            ProcessingError::Transport(_) => self.metrics.processing_failures.inc(),
-            _ => self.metrics.decode_failures.inc(),
-        }
-
-        let public_reason = reason.public_reason();
-        if let (Some(producer), Some(dlq_cfg)) =
-            (self.producer.as_ref(), pipeline.config.dlq.as_ref())
-        {
-            if let Err(err) =
-                dlq::publish(producer, &pipeline.name, dlq_cfg, ctx, reason, payload).await
-            {
-                error!(
-                    context = %ctx.correlation_id(),
-                    error = %err,
-                    "dlq publish failed"
-                );
+/// Extracts the retry count from Kafka message headers.
+///
+/// Iterates through message headers to find the "retry_count" header, converts its value
+/// from bytes to UTF-8, parses it to u32, and returns `Some(count)` on success or `None`
+/// if the header is absent, malformed, or unparseable.
+fn extract_retry_count(headers: Option<&BorrowedHeaders>) -> Option<u32> {
+    headers.and_then(|hdrs| {
+        (0..hdrs.count()).find_map(|i| {
+            let header = hdrs.get(i);
+            if header.key == "retry_count" {
+                let value = header.value?;
+                let s = std::str::from_utf8(value).ok()?;
+                s.parse::<u32>().ok()
             } else {
-                self.metrics.dlq_total.inc();
-                warn!(
-                    context = %ctx.correlation_id(),
-                    reason_code = %public_reason.code,
-                    reason_message = %public_reason.message,
-                    "sent to dlq"
-                );
+                None
             }
-        } else {
-            warn!(
-                context = %ctx.correlation_id(),
-                reason_code = %public_reason.code,
-                reason_message = %public_reason.message,
-                "dlq disabled; message skipped"
-            );
-        }
-        self.commit_offset(ctx).await;
+        })
+    })
+}
+
+/// Holds per-pipeline message channels and metadata
+#[derive(Clone)]
+struct PipelineChannels {
+    /// Sender for routing messages to this pipeline
+    tx: mpsc::Sender<(MessageContext, OwnedMessage)>,
+}
+
+/// Manages a set of per-pipeline channels
+struct PipelineChannelRegistry {
+    /// Map from topic name to pipeline channels
+    channels_by_topic: HashMap<String, PipelineChannels>,
+}
+
+impl PipelineChannelRegistry {
+    /// Gets the sender for the given topic
+    fn get_sender(&self, topic: &str) -> Option<mpsc::Sender<(MessageContext, OwnedMessage)>> {
+        self.channels_by_topic.get(topic).map(|pc| pc.tx.clone())
     }
 }
 
 async fn run_fetch_loop(
     consumer: Arc<StreamConsumer>,
-    tx: mpsc::Sender<(MessageContext, OwnedMessage)>,
+    channel_registry: Arc<parking_lot::Mutex<PipelineChannelRegistry>>,
     metrics: Metrics,
     health: Arc<HealthRegistry>,
     last_poll: Arc<AtomicU64>,
@@ -306,13 +98,18 @@ async fn run_fetch_loop(
                             Ordering::Relaxed,
                         );
                         let _ = health.set_kafka_status(ComponentStatus::Healthy);
+
+                        let retry_count = extract_retry_count(msg.headers());
+
                         let ctx = MessageContext {
                             topic: msg.topic().to_string(),
                             partition: msg.partition(),
                             offset: msg.offset(),
                             timestamp: msg.timestamp().to_millis().unwrap_or(0),
+                            retry_count,
                         };
                         metrics.messages_total.inc();
+                        #[allow(clippy::collapsible_if)]
                         if let Some(ts) = msg.timestamp().to_millis() {
                             if let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) {
                                 let lag = now.as_millis() as i64 - ts;
@@ -322,9 +119,20 @@ async fn run_fetch_loop(
                                     .set(lag);
                             }
                         }
-                        if tx.send((ctx, msg.detach())).await.is_err() {
-                            warn!("channel closed; stopping fetch loop");
-                            break;
+
+                        // Route message to the correct pipeline channel
+                        let tx = {
+                            let registry = channel_registry.lock();
+                            registry.get_sender(&ctx.topic)
+                        };
+
+                        if let Some(tx) = tx {
+                            let topic_for_log = ctx.topic.clone();
+                            if tx.send((ctx, msg.detach())).await.is_err() {
+                                warn!("pipeline channel closed for topic {}", topic_for_log);
+                            }
+                        } else {
+                            warn!("no pipeline channel for topic {}", ctx.topic);
                         }
                     }
                     Ok(Some(Err(err))) => {
@@ -387,77 +195,310 @@ async fn run_heartbeat_task(
     }
 }
 
-/// Processes incoming Kafka messages from the given receiver, routes each message to the pipeline
-/// configured for its topic, decodes the message payload as UTF-8, and enqueues produced messages
-/// into the batching pipeline. Decode or processing failures are handled and the original message
+async fn run_circuit_breaker_metrics_task(
+    circuit_breakers_by_pipeline: HashMap<String, Arc<CircuitBreaker>>,
+    metrics: Metrics,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) {
+    let mut interval = interval(Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                info!("circuit breaker metrics task shutting down");
+                break;
+            }
+            _ = interval.tick() => {
+                for (pipeline_name, cb) in &circuit_breakers_by_pipeline {
+                    let state = cb.get_state();
+                    let state_value = match state {
+                        crate::circuit_breaker::CircuitBreakerState::Closed => 0,
+                        crate::circuit_breaker::CircuitBreakerState::Open => 1,
+                        crate::circuit_breaker::CircuitBreakerState::HalfOpen => 2,
+                    };
+                    metrics
+                        .circuit_breaker_state
+                        .with_label_values(&[pipeline_name])
+                        .set(state_value);
+                }
+            }
+        }
+    }
+}
+
+/// Processes incoming Kafka messages from the given receiver for a specific pipeline.
+///
+/// Receives messages for a single pipeline from `rx`, routes each message through the pipeline
+/// configuration, decodes the message payload as UTF-8, and enqueues produced messages
+/// into the pipeline's batcher. Decode or processing failures are handled and the original message
 /// offset is committed or skipped as appropriate.
 ///
 /// The loop runs until the receiver is closed; when finished, it logs that processing has stopped.
-///
-/// # Examples
-///
-/// ```no_run
-/// use rdkafka::consumer::StreamConsumer;
-/// use std::sync::Arc;
-/// use tokio::sync::mpsc;
-///
-/// // Assume `context` is a prepared ConsumerContext and `consumer` is an Arc<StreamConsumer>.
-/// // Create a channel and start the processing loop task.
-/// let (tx, rx) = mpsc::channel(128);
-/// let context = /* ConsumerContext prepared elsewhere */;
-/// let consumer = /* Arc<StreamConsumer> prepared elsewhere */;
-///
-/// // spawn the processing loop (example; uses tokio runtime)
-/// tokio::spawn(async move {
-///     run_processing_loop(rx, context, consumer).await;
-/// });
-/// ```
-async fn run_processing_loop(
+async fn run_pipeline_processing_loop(
+    pipeline: Pipeline,
     rx: mpsc::Receiver<(MessageContext, OwnedMessage)>,
-    context: ConsumerContext,
-    _consumer: Arc<StreamConsumer>,
+    context: Arc<PipelineProcessingContext>,
 ) {
     let mut stream = ReceiverStream::new(rx);
 
     while let Some((ctx, msg)) = stream.next().await {
-        let pipeline = match context.pipelines_by_topic.get(&ctx.topic) {
-            Some(p) => p,
-            None => {
-                warn!(context = %ctx.correlation_id(), "no pipeline for topic");
-                context.commit_offset(&ctx).await;
-                continue;
-            }
-        };
+        // Check circuit breaker before processing
+        if context.circuit_breaker.try_execute().is_err() {
+            // Extract payload for DLQ publishing
+            let payload = match msg.payload_view::<str>() {
+                Some(Ok(p)) => p.to_string(),
+                Some(Err(e)) => {
+                    warn!(
+                        context = %ctx.correlation_id(),
+                        pipeline_name = %pipeline.name,
+                        error = %e,
+                        "circuit breaker open and failed to extract payload for DLQ"
+                    );
+                    // Commit offset since we can't process or DLQ this message
+                    context.commit_offset(&ctx).await;
+                    continue;
+                }
+                None => {
+                    warn!(
+                        context = %ctx.correlation_id(),
+                        pipeline_name = %pipeline.name,
+                        "circuit breaker open and message has no payload for DLQ"
+                    );
+                    // Commit offset since we can't process or DLQ this message
+                    context.commit_offset(&ctx).await;
+                    continue;
+                }
+            };
+
+            // Create circuit breaker error and send to DLQ
+            let circuit_breaker_error = ProcessingError::Validation(ValidationError::new(
+                "circuit breaker is open - message sent to DLQ for preservation".to_string(),
+            ));
+
+            context
+                .handle_processing_error(&pipeline, &ctx, &circuit_breaker_error, &payload)
+                .await;
+            continue;
+        }
 
         let payload = match msg.payload_view::<str>() {
             Some(Ok(p)) => p.to_string(),
             Some(Err(e)) => {
                 context
-                    .handle_decode_error(pipeline, &ctx, format!("utf8 decode failed: {}", e))
+                    .handle_decode_error(&pipeline, &ctx, format!("utf8 decode failed: {}", e))
                     .await;
+                context.circuit_breaker.record_failure();
                 continue;
             }
             None => {
                 context
-                    .handle_decode_error(pipeline, &ctx, "empty payload".to_string())
+                    .handle_decode_error(&pipeline, &ctx, "empty payload".to_string())
                     .await;
+                context.circuit_breaker.record_failure();
                 continue;
             }
         };
 
-        match context.process_message(&payload, pipeline, &ctx).await {
+        match context.process_message(&payload, &pipeline, &ctx).await {
             Ok(_) => {
                 // Message added to batcher, offset will be committed after batch write
+                context.circuit_breaker.record_success();
             }
             Err(reason) => {
                 context
-                    .handle_processing_error(pipeline, &ctx, &reason, &payload)
+                    .handle_processing_error(&pipeline, &ctx, &reason, &payload)
                     .await;
+                context.circuit_breaker.record_failure();
             }
         }
     }
 
-    info!("processing loop finished");
+    info!(pipeline_name = %pipeline.name, "pipeline processing loop finished");
+}
+
+/// Shared context for pipeline processing
+struct PipelineProcessingContext {
+    consumer: Arc<StreamConsumer>,
+    batcher: Arc<tokio::sync::Mutex<Batcher>>,
+    metrics: Metrics,
+    health: Arc<HealthRegistry>,
+    producer: Option<FutureProducer>,
+    circuit_breaker: Arc<CircuitBreaker>,
+}
+
+impl PipelineProcessingContext {
+    /// Enqueues a processed message and its context into the batcher for the specified pipeline and table.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the message was accepted into the batcher, `Err(ProcessingError)` if adding failed.
+    async fn add_to_batcher(
+        &self,
+        pipeline_name: &str,
+        table: &str,
+        message: Value,
+        context: &MessageContext,
+    ) -> Result<(), ProcessingError> {
+        info!(context = %context.correlation_id(), "adding to batcher");
+        let mut batcher_guard = self.batcher.lock().await;
+        batcher_guard
+            .add_message(pipeline_name, table, message, context.clone())
+            .await
+    }
+
+    /// Commit the consumer offset for the provided message context.
+    async fn commit_offset(&self, ctx: &MessageContext) {
+        let mut tpl = TopicPartitionList::new();
+        if let Err(e) =
+            tpl.add_partition_offset(&ctx.topic, ctx.partition, Offset::Offset(ctx.offset + 1))
+        {
+            warn!("Failed to add partition offset to list: {}", e);
+            return;
+        }
+        if let Err(e) = self.consumer.commit(&tpl, CommitMode::Async) {
+            self.metrics.processing_failures.inc();
+            warn!(context = %ctx.correlation_id(), error = %e, "offset commit failed");
+        } else {
+            info!(context = %ctx.correlation_id(), "committed offset for failed message");
+        }
+    }
+
+    /// Handle a message decoding failure for a pipeline and finalize the message offset.
+    async fn handle_decode_error(
+        &self,
+        pipeline: &Pipeline,
+        ctx: &MessageContext,
+        error_msg: String,
+    ) {
+        if let Err(err) = self
+            .health
+            .update_pipeline_error(&pipeline.name, error_msg.clone())
+        {
+            warn!("Failed to update pipeline error status: {}", err);
+        }
+        self.metrics.decode_failures.inc();
+        warn!(context = %ctx.correlation_id(), error = %error_msg, "decode error");
+        self.commit_offset(ctx).await;
+    }
+
+    /// Process a single message payload through the given pipeline
+    async fn process_message(
+        &self,
+        payload: &str,
+        pipeline: &Pipeline,
+        ctx: &MessageContext,
+    ) -> Result<(), ProcessingError> {
+        info!(context = %ctx.correlation_id(), "processing message");
+        let mut decoded = decode_and_validate(payload.as_bytes(), &pipeline.config)?;
+
+        if let serde_json::Value::Object(ref mut map) = decoded {
+            map.insert(
+                "_meta_topic".to_string(),
+                serde_json::Value::String(ctx.topic.clone()),
+            );
+            map.insert(
+                "_meta_partition".to_string(),
+                serde_json::Value::Number(ctx.partition.into()),
+            );
+            map.insert(
+                "_meta_offset".to_string(),
+                serde_json::Value::Number(ctx.offset.into()),
+            );
+            map.insert(
+                "_meta_ingest_ts".to_string(),
+                serde_json::Value::Number(ctx.timestamp.into()),
+            );
+        }
+
+        // Execute EIP pipeline
+        let stage_ctx = StageContext {
+            correlation_id: ctx.correlation_id().to_string(),
+            pipeline_name: pipeline.name.clone(),
+            message_metadata: MessageMetadata::from_kafka(
+                ctx.topic.clone(),
+                ctx.partition,
+                ctx.offset,
+                Some(ctx.timestamp),
+            ),
+        };
+
+        let processed_messages = pipeline.execute(&stage_ctx, decoded).await?;
+
+        // Batch processed messages
+        for msg in processed_messages {
+            // Check for routing metadata
+            let candidate = msg
+                .get("_destination_table")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&pipeline.config.staging_table);
+
+            let table = crate::config::validate_table_identifier(candidate)
+                .map_err(|e| ProcessingError::Validation(ValidationError::new(e.to_string())))?;
+
+            self.add_to_batcher(&pipeline.name, table, msg.clone(), ctx)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Handle a processing error for a message
+    async fn handle_processing_error(
+        &self,
+        pipeline: &Pipeline,
+        ctx: &MessageContext,
+        reason: &ProcessingError,
+        payload: &str,
+    ) {
+        if let Err(err) = self
+            .health
+            .update_pipeline_error(&pipeline.name, reason.to_string())
+        {
+            warn!("Failed to update pipeline error status: {}", err);
+        }
+
+        match reason {
+            ProcessingError::Transport(_) => self.metrics.processing_failures.inc(),
+            _ => self.metrics.decode_failures.inc(),
+        }
+
+        let public_reason = reason.public_reason();
+        if let Some(producer) = self.producer.as_ref() {
+            if let Some(dlq_cfg) = pipeline.config.dlq.as_ref() {
+                if let Err(err) =
+                    dlq::publish(producer, &pipeline.name, dlq_cfg, ctx, reason, payload, None).await
+                {
+                    error!(
+                        context = %ctx.correlation_id(),
+                        error = %err,
+                        "dlq publish failed"
+                    );
+                } else {
+                    self.metrics.dlq_total.inc();
+                    warn!(
+                        context = %ctx.correlation_id(),
+                        reason_code = %public_reason.code,
+                        reason_message = %public_reason.message,
+                        "sent to dlq"
+                    );
+                }
+            } else {
+                warn!(
+                    context = %ctx.correlation_id(),
+                    reason_code = %public_reason.code,
+                    reason_message = %public_reason.message,
+                    "dlq disabled; message skipped"
+                );
+            }
+        } else {
+            warn!(
+                context = %ctx.correlation_id(),
+                reason_code = %public_reason.code,
+                reason_message = %public_reason.message,
+                "dlq disabled; message skipped"
+            );
+        }
+        self.commit_offset(ctx).await;
+    }
 }
 
 /// Process maps of committed offsets and commit them to Kafka, updating metrics on failures.
@@ -589,17 +630,7 @@ pub async fn replay(
         topic, partition, start_offset, end_offset
     );
 
-    // For replay, we use the writer directly without batching, so batcher is None
-    let context = ConsumerContext {
-        consumer: Arc::new(consumer),
-        batcher: None,
-        metrics: _metrics,
-        health: Arc::new(HealthRegistry::new(Duration::from_secs(30))),
-        pipelines_by_topic,
-        producer: None,
-    };
-
-    let mut stream = context.consumer.stream();
+    let mut stream = consumer.stream();
 
     while let Some(message) = stream.next().await {
         match message {
@@ -609,22 +640,66 @@ pub async fn replay(
                     break;
                 }
 
+                let retry_count = extract_retry_count(msg.headers());
+
                 let ctx = MessageContext {
                     topic: msg.topic().to_string(),
                     partition: msg.partition(),
                     offset: msg.offset(),
                     timestamp: msg.timestamp().to_millis().unwrap_or(0),
+                    retry_count,
                 };
 
                 match msg.payload() {
                     Some(payload) => match std::str::from_utf8(payload) {
                         Ok(payload_str) => {
-                            match context.process_message(payload_str, &pipeline, &ctx).await {
-                                Ok(_) => {
-                                    info!(context = %ctx.correlation_id(), "replayed successfully");
+                            // Decode and validate
+                            match decode_and_validate(payload_str.as_bytes(), &pipeline.config) {
+                                Ok(mut decoded) => {
+                                    // Inject metadata
+                                    if let serde_json::Value::Object(ref mut map) = decoded {
+                                        map.insert(
+                                            "_meta_topic".to_string(),
+                                            serde_json::Value::String(ctx.topic.clone()),
+                                        );
+                                        map.insert(
+                                            "_meta_partition".to_string(),
+                                            serde_json::Value::Number(ctx.partition.into()),
+                                        );
+                                        map.insert(
+                                            "_meta_offset".to_string(),
+                                            serde_json::Value::Number(ctx.offset.into()),
+                                        );
+                                        map.insert(
+                                            "_meta_ingest_ts".to_string(),
+                                            serde_json::Value::Number(ctx.timestamp.into()),
+                                        );
+                                    }
+
+                                    // Execute pipeline
+                                    let stage_ctx = StageContext {
+                                        correlation_id: ctx.correlation_id().to_string(),
+                                        pipeline_name: pipeline.name.clone(),
+                                        message_metadata: MessageMetadata::from_kafka(
+                                            ctx.topic.clone(),
+                                            ctx.partition,
+                                            ctx.offset,
+                                            Some(ctx.timestamp),
+                                        ),
+                                    };
+
+                                    match pipeline.execute(&stage_ctx, decoded).await {
+                                        Ok(_processed_messages) => {
+                                            info!(context = %ctx.correlation_id(), "replayed successfully");
+                                        }
+                                        Err(e) => {
+                                            error!(context = %ctx.correlation_id(), error = %e, "processing failed during replay; stopping");
+                                            return Err(e.into());
+                                        }
+                                    }
                                 }
                                 Err(e) => {
-                                    error!(context = %ctx.correlation_id(), error = %e, "processing failed during replay; stopping");
+                                    error!(context = %ctx.correlation_id(), error = %e, "decode failed");
                                     return Err(e.into());
                                 }
                             }
@@ -644,6 +719,41 @@ pub async fn replay(
                 return Err(e.into());
             }
         }
+    }
+
+    Ok(())
+}
+
+async fn sync_offsets(
+    cfg: &KafkaConfig,
+    offset_tracker: &OffsetTracker,
+    pipelines: &[crate::eip::PipelineConfig],
+) -> Result<()> {
+    info!("Syncing offsets from DB to Kafka...");
+    let consumer = build_consumer(cfg)?;
+
+    let mut tpl = TopicPartitionList::new();
+    let mut count = 0;
+
+    for pipeline in pipelines {
+        let db_offsets = offset_tracker
+            .read_topic_offsets(&pipeline.name, &pipeline.topic)
+            .await?;
+        for (partition, offset) in db_offsets {
+            // We commit offset + 1 because Kafka expects the *next* offset to fetch
+            tpl.add_partition_offset(&pipeline.topic, partition, Offset::Offset(offset + 1))?;
+            count += 1;
+        }
+    }
+
+    if count > 0 {
+        info!("Found {} offsets to sync", count);
+        // We must assign to commit
+        consumer.assign(&tpl)?;
+        consumer.commit(&tpl, CommitMode::Sync)?;
+        info!("Offsets synced successfully");
+    } else {
+        info!("No offsets found in DB to sync");
     }
 
     Ok(())
@@ -696,16 +806,16 @@ pub async fn run(
         health.register_pipeline(&p.name);
     }
 
+    if cfg.postgres.enable_offset_tracking {
+        let pool = writer.pool();
+        let tracker = OffsetTracker::new(pool.clone());
+        tracker.init().await?;
+        sync_offsets(&cfg.kafka, &tracker, &cfg.pipelines).await?;
+    }
+
     let shutdown_rx_heartbeat = shutdown_rx.resubscribe();
     let shutdown_rx_fetch = shutdown_rx.resubscribe();
-    let _shutdown_rx_batcher = shutdown_rx.resubscribe();
-
-    let capacity = cfg
-        .pipelines
-        .iter()
-        .map(|p| p.backpressure.channel_capacity)
-        .max()
-        .unwrap_or(1024);
+    let shutdown_rx_metrics = shutdown_rx.resubscribe();
 
     let consumer = Arc::new(build_consumer(&cfg.kafka)?);
     let last_poll = Arc::new(AtomicU64::new(
@@ -729,39 +839,122 @@ pub async fn run(
         None
     };
 
-    // Create committed offsets channel
-    let (committed_offsets_tx, committed_offsets_rx) =
-        tokio::sync::mpsc::unbounded_channel::<HashMap<(String, i32), i64>>();
+    // Create per-pipeline channels and batchers
+    let mut channels_by_topic = HashMap::new();
+    let mut processing_tasks = Vec::new();
+    let mut circuit_breakers_by_pipeline = HashMap::new();
 
-    // Create batcher
     let shutdown_coordinator = ShutdownCoordinator::default();
-    let batcher_config = BatcherConfig::from_pipeline_config(
-        &cfg.pipelines[0], // Use first pipeline for config, could be made per-pipeline later
-        &cfg.postgres,
-        cfg.service.shutdown_timeout_duration(),
-    );
-    let batcher = Arc::new(tokio::sync::Mutex::new(Batcher::new(
-        batcher_config,
-        writer.clone(),
-        metrics.clone(),
-        &shutdown_coordinator,
-        committed_offsets_tx,
-    )));
 
-    let (tx, rx) = mpsc::channel::<(MessageContext, OwnedMessage)>(capacity);
+    for pipeline_cfg in &cfg.pipelines {
+        let pipeline_name = pipeline_cfg.name.clone();
+        let topic = pipeline_cfg.topic.clone();
+        let capacity = pipeline_cfg.backpressure.channel_capacity;
 
-    let context = ConsumerContext {
-        consumer: consumer.clone(),
-        batcher: Some(batcher.clone()),
-        metrics: metrics.clone(),
-        health: health.clone(),
-        pipelines_by_topic,
-        producer,
-    };
+        // Create channel for this pipeline
+        let (tx, rx) = mpsc::channel::<(MessageContext, OwnedMessage)>(capacity);
+        channels_by_topic.insert(topic.clone(), PipelineChannels { tx });
+
+        // Create batcher for this pipeline
+        let batcher_config = BatcherConfig::from_pipeline_config(
+            pipeline_cfg,
+            &cfg.postgres,
+            cfg.service.shutdown_timeout_duration(),
+        );
+
+        let (committed_offsets_tx, committed_offsets_rx) =
+            tokio::sync::mpsc::unbounded_channel::<HashMap<(String, i32), i64>>();
+
+        let batcher = Arc::new(tokio::sync::Mutex::new(Batcher::new(
+            batcher_config,
+            writer.clone(),
+            metrics.clone(),
+            &shutdown_coordinator,
+            committed_offsets_tx,
+        )));
+
+        // Get the pipeline from pipelines_by_topic
+        let pipeline = pipelines_by_topic
+            .get(&topic)
+            .expect("pipeline should exist")
+            .clone();
+
+        // Create circuit breaker for this pipeline
+        let circuit_breaker = Arc::new(CircuitBreaker::new(
+            pipeline_name.clone(),
+            pipeline_cfg.circuit_breaker.clone(),
+        ));
+        circuit_breakers_by_pipeline.insert(pipeline_name.clone(), circuit_breaker.clone());
+
+        // Create processing context
+        let processing_context = Arc::new(PipelineProcessingContext {
+            consumer: consumer.clone(),
+            batcher: batcher.clone(),
+            metrics: metrics.clone(),
+            health: health.clone(),
+            producer: producer.clone(),
+            circuit_breaker: circuit_breaker.clone(),
+        });
+
+        // Spawn batcher background flush task for this pipeline
+        {
+            let batcher_for_flush = batcher.clone();
+            let pipeline_name_clone = pipeline_name.clone();
+            let mut shutdown_rx_flush = shutdown_rx.resubscribe();
+
+            let flush_task = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(1000));
+                loop {
+                    tokio::select! {
+                        _ = shutdown_rx_flush.recv() => {
+                            info!(pipeline_name = %pipeline_name_clone, "batcher flush task received shutdown signal");
+                            let mut batcher_guard = batcher_for_flush.lock().await;
+                            if let Err(e) = batcher_guard.flush_all_buffers(FlushReason::Shutdown).await {
+                                error!(pipeline_name = %pipeline_name_clone, "batcher shutdown flush failed: {}", e);
+                            }
+                            break;
+                        }
+                        _ = interval.tick() => {
+                            let mut batcher_guard = batcher_for_flush.lock().await;
+                            if let Err(e) = batcher_guard.flush_pending_buffers().await {
+                                error!(pipeline_name = %pipeline_name_clone, "batcher periodic flush failed: {}", e);
+                            }
+                        }
+                    }
+                }
+            });
+            processing_tasks.push(flush_task);
+        }
+
+        // Spawn committed offsets handler for this pipeline
+        {
+            let committed_offsets_task = tokio::spawn(run_committed_offsets_handler(
+                committed_offsets_rx,
+                consumer.clone(),
+                metrics.clone(),
+            ));
+            processing_tasks.push(committed_offsets_task);
+        }
+
+        // Spawn processing loop for this pipeline
+        {
+            let processing_task = tokio::spawn(run_pipeline_processing_loop(
+                pipeline,
+                rx,
+                processing_context,
+            ));
+            processing_tasks.push(processing_task);
+        }
+    }
+
+    // Create channel registry for fetch loop
+    let channel_registry = Arc::new(parking_lot::Mutex::new(PipelineChannelRegistry {
+        channels_by_topic,
+    }));
 
     let fetch_loop = tokio::spawn(run_fetch_loop(
         consumer.clone(),
-        tx,
+        channel_registry,
         metrics.clone(),
         health.clone(),
         last_poll.clone(),
@@ -776,30 +969,20 @@ pub async fn run(
         shutdown_rx_heartbeat,
     ));
 
-    let processing_loop = tokio::spawn(run_processing_loop(rx, context, consumer.clone()));
-
-    // Spawn batcher background flush task
-    let batcher_task = tokio::spawn(async move {
-        let mut batcher_guard = batcher.lock().await;
-        if let Err(e) = batcher_guard.run_background_flush().await {
-            error!("batcher background flush failed: {}", e);
-        }
-    });
-
-    // Spawn committed offsets handler task
-    let committed_offsets_task = tokio::spawn(run_committed_offsets_handler(
-        committed_offsets_rx,
-        consumer.clone(),
+    // Spawn circuit breaker metrics update task
+    let circuit_breaker_metrics_task = tokio::spawn(run_circuit_breaker_metrics_task(
+        circuit_breakers_by_pipeline,
         metrics.clone(),
+        shutdown_rx_metrics,
     ));
 
-    tokio::try_join!(
-        fetch_loop,
-        processing_loop,
-        heartbeat_task,
-        batcher_task,
-        committed_offsets_task
-    )?;
+    // Wait for fetch and heartbeat to complete, then join all processing tasks
+    let _ = tokio::join!(fetch_loop, heartbeat_task, circuit_breaker_metrics_task);
+
+    for task in processing_tasks {
+        let _ = task.await;
+    }
+
     info!("consumer loops stopped");
     Ok(())
 }
@@ -829,6 +1012,7 @@ fn build_consumer(cfg: &KafkaConfig) -> Result<StreamConsumer> {
         .set("session.timeout.ms", cfg.session_timeout_ms.to_string())
         .set("enable.auto.commit", "false")
         .set("enable.auto.offset.store", "false")
+        .set("auto.offset.reset", "earliest")
         .set(
             "max.in.flight.requests.per.connection",
             cfg.max_inflight_messages.to_string(),

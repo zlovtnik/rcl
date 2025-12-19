@@ -1,4 +1,5 @@
 mod batcher;
+mod circuit_breaker;
 mod config;
 mod consumer;
 mod decoder;
@@ -10,9 +11,12 @@ mod integration_tests;
 mod load_test;
 mod logging;
 mod metrics;
+mod offset_tracker;
+mod retry;
 mod shutdown;
 mod stages;
 mod types;
+mod worker_pool;
 mod writer;
 
 use crate::config::Config;
@@ -120,7 +124,7 @@ async fn main() -> Result<()> {
                 cfg.service.health_check_timeout_ms,
             )));
             let writer: Arc<Writer> =
-                Arc::new(Writer::new(writer_cfg, metrics.clone(), health).await?);
+                Arc::new(Writer::new(writer_cfg, metrics.clone(), health, cfg.retry).await?);
 
             consumer::replay(
                 cfg,
@@ -170,8 +174,9 @@ async fn run_service(cfg: Config) -> Result<()> {
     let cfg = Arc::new(cfg);
     let shutdown_timeout = cfg.service.shutdown_timeout_duration();
     let writer_cfg = Arc::new(cfg.postgres.clone());
+    let retry_cfg = cfg.retry;
     let writer: Arc<Writer> =
-        Arc::new(Writer::new(writer_cfg, metrics.clone(), health.clone()).await?);
+        Arc::new(Writer::new(writer_cfg, metrics.clone(), health.clone(), retry_cfg).await?);
 
     let (coordinator, shutdown_rx) = shutdown::ShutdownCoordinator::new();
 
