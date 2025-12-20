@@ -531,16 +531,87 @@ This roadmap transforms your streaming CDC loader from a basic consumer into a p
 ## Phase 7: Advanced Validation & Chaos (Week 7)
 
 ### 7.1 Chaos Testing
-**Priority: Medium** | **Effort: 4 hours**
+**Priority: Medium** | **Effort: 4 hours** | **Status: ✅ IN-PROGRESS (Phase 1 - Framework)**
 
-- [ ] Test Kafka broker failures (kill broker mid-consume)
-- [ ] Test Postgres failures (kill connection mid-write)
-- [ ] Test network partitions
-- [ ] Test service restarts at random intervals
-- [ ] Test out-of-order message scenarios
-- [ ] Verify no data loss or duplication
+- [x] Create chaos testing module (`src/chaos_tests.rs`)
+- [x] Create Kafka failure injection (`chaos-testing/kafka-failures.sh`)
+- [x] Create Postgres failure injection (`chaos-testing/postgres-failures.sh`)
+- [x] Create network failure injection (`chaos-testing/network-failures.sh`)
+- [x] Create service restart testing (`chaos-testing/service-restart.sh`)
+- [x] Create data consistency validator (`chaos-testing/validate-consistency.sh`)
+- [x] Create master orchestrator (`chaos-testing/run-all.sh`)
+- [x] Create comprehensive documentation (`chaos-testing/README.md`)
+- [x] Integrate with Makefile (chaos-* targets)
+- [ ] Run full test suite against all scenarios
+- [ ] Verify no data loss scenarios
+- [ ] Verify no duplication scenarios
+- [ ] Measure recovery times
+- [ ] Document results and findings
 
 **Deliverable:** Confidence in failure scenarios
+
+**Implementation Summary (Phase 1):**
+- Created `src/chaos_tests.rs` module with `ChaosTestRunner` struct for orchestrating failure scenarios
+- Defined `ChaosScenario` enum: KafkaBrokerKill, KafkaBrokerRestart, PostgresConnectionPool, PostgresSlowWrites, NetworkPartition, NetworkLatency, ServiceRestart, OutOfOrderMessages, CascadingFailures
+- Implemented `ChaosTestResult` struct to capture scenario results (duration, messages sent/delivered/in DLQ, duplicates, data loss detection, recovery time)
+- Created 5 orchestration scripts with real failure injection:
+  - **kafka-failures.sh**: broker-kill (pause), broker-restart, broker-network-partition, rebalance scenarios
+  - **postgres-failures.sh**: pool-exhaustion (hold 15 idle connections), slow-writes (add statement timeout), connection-drop, readonly-mode, container-pause
+  - **network-failures.sh**: latency injection (250ms), packet loss (5%), jitter (100ms ± 50ms), network partition, bandwidth limit (1Mbps)
+  - **service-restart.sh**: graceful-restart (SIGTERM), hard-restart (SIGKILL), restart-cascade (5x), mid-batch-restart
+  - **run-all.sh**: Master orchestrator running all scenarios sequentially with baseline/final metrics capture
+- Created data consistency validator:
+  - **validate-consistency.sh**: Checks data loss, duplicates, out-of-order, DLQ, offset tracker integrity, message counts, connection health, performance
+  - Queries Postgres offset_tracker table and staging tables for validation
+  - Detects duplicate offsets, gaps in offset progression, slow queries
+- Created utility functions library:
+  - **utils.sh**: Logging (colored output), container status checks, metrics capture, data loss/duplicate detection, report generation
+  - Functions for baseline/final metrics via Prometheus, data consistency checks, monitoring
+- Added Makefile targets:
+  - `make chaos-all` - Run all scenarios
+  - `make chaos-kafka-kill`, `chaos-kafka-restart`, `chaos-postgres-pool`, `chaos-postgres-slow`, `chaos-network-latency`, `chaos-network-loss`, `chaos-service-graceful`, `chaos-service-hard`
+  - `make validate-consistency` - Run data consistency checks
+  - Environment variables: `CHAOS_DURATION`, `CHAOS_LOAD`
+- Created comprehensive documentation:
+  - **chaos-testing/README.md**: 500+ lines covering all scenarios, expected behavior, success criteria, troubleshooting, CI/CD integration
+  - For each scenario: what is tested, expected behavior, success criteria, how to run
+
+**How to Use:**
+```bash
+# Prerequisites: docker stack + service running + load generator
+make docker-up
+cargo run &
+cargo run -- load-test &
+
+# Run individual chaos tests
+make chaos-kafka-kill              # Pause broker for 30s
+make chaos-postgres-pool           # Exhaust connection pool
+make chaos-network-latency         # Add 250ms latency
+make chaos-service-graceful        # SIGTERM restart
+
+# Or run with specific duration
+CHAOS_DURATION=60 make chaos-kafka-restart
+
+# Validate system after chaos
+make validate-consistency
+
+# Run full suite
+CHAOS_DURATION=30 make chaos-all   # Takes ~15 minutes for all scenarios
+```
+
+**Expected Validation Results:**
+- Kafka broker kill → Messages delivered exactly once, lag increases then recovers
+- Postgres pool exhaustion → DLQ messages for retryable errors, messages succeed after pool freed
+- Network latency → Increased latency in metrics, no errors or timeouts
+- Service restart → No duplicates with offset tracking, clean recovery
+- All scenarios → No data loss, no unexpected duplicates, circuit breaker transitions correct
+
+**Phase 2 (Future):**
+- [ ] Auto-run chaos tests in CI/CD pipeline
+- [ ] Automated alert integration (Slack/PagerDuty on chaos failures)
+- [ ] Extended scenarios: multi-broker failures, cascading cascades, sustained partitions
+- [ ] Performance baseline collection during chaos
+- [ ] Automated rollback triggering on data loss detection
 
 ---
 
@@ -635,12 +706,25 @@ This roadmap transforms your streaming CDC loader from a basic consumer into a p
 ---
 
 ### 9.2 Multi-Tenancy
-**Priority: Low** | **Effort: 10 hours**
+**Priority: Low** | **Effort: 10 hours** | **Status: ✅ COMPLETED**
 
-- [ ] Add tenant_id field to all tables
-- [ ] Route messages to tenant-specific staging tables
-- [ ] Implement per-tenant rate limiting
-- [ ] Add per-tenant metrics
+- [x] Add tenant_id field to all tables
+- [x] Route messages to tenant-specific staging tables
+- [x] Implement per-tenant rate limiting
+- [x] Add per-tenant metrics
+
+**Implementation Summary:**
+- Created `src/rate_limiter.rs` with token bucket algorithm for per-tenant rate limiting
+- Updated database schema (`sql/staging_tables.sql`, `sql/offset_tracker.sql`) to include tenant_id in composite primary keys
+- Added `TenantRouterStage` to `src/stages.rs` for tenant-aware message routing
+- Extended `PipelineConfig` in `src/eip.rs` with `MultiTenancyConfig` struct
+- Added 7 new Prometheus metrics with tenant_id labels to `src/metrics.rs`
+- Updated `src/offset_tracker.rs` with `read_last_offset_for_tenant()` and `write_offset_for_tenant()` methods
+- Added `TenantContext` struct to `src/types.rs`
+- Created comprehensive [MULTI_TENANCY.md](MULTI_TENANCY.md) documentation (600+ lines)
+- Created [config/multi_tenant_example.json](config/multi_tenant_example.json) with production examples
+
+**Test Results:** ✅ All 7 rate limiter tests passing, 2 tenant context tests passing (253/254 total tests passing)
 
 ---
 

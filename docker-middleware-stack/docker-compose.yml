@@ -72,10 +72,9 @@ services:
       SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:9093
       SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
       SCHEMA_REGISTRY_JMX_PORT: 1099
-      SCHEMA_REGISTRY_JMX_OPTS: "-Dcom.sun.management.jmxremote -Dcom.sun.management.jmxremote.authenticate=true -Dcom.sun.management.jmxremote.ssl=false -Dcom.sun.management.jmxremote.local.only=false -Dcom.sun.management.jmxremote.port=1099 -Dcom.sun.management.jmxremote.rmi.port=1099 -Dcom.sun.management.jmxremote.password.file=/opt/schema-registry/jmxremote.password -Dcom.sun.management.jmxremote.access.file=/opt/schema-registry/jmxremote.access"
-    volumes:
-      - ./configs/schema-registry/jmxremote.password:/opt/schema-registry/jmxremote.password
-      - ./configs/schema-registry/jmxremote.access:/opt/schema-registry/jmxremote.access
+      # Disable JMX authentication for local development (authentication requires file permissions we can't reliably set in Docker)
+      # For production, use proper secret management and fix file permissions in the Dockerfile
+      SCHEMA_REGISTRY_JMX_OPTS: "-Dcom.sun.management.jmxremote -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false -Dcom.sun.management.jmxremote.local.only=false -Dcom.sun.management.jmxremote.port=1099 -Dcom.sun.management.jmxremote.rmi.port=1099"
     networks:
       - middleware
     healthcheck:

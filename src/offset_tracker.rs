@@ -21,22 +21,113 @@ impl OffsetTracker {
 
     /// Initialize the offset_tracker table (idempotent)
     /// Run on application startup to ensure table exists
+    /// Handles migration for existing tables that lack tenant_id column
     pub async fn init(&self) -> Result<()> {
+        // First, try to create the table with the full schema
         let init_sql = include_str!("../sql/offset_tracker.sql");
-        sqlx::raw_sql(init_sql)
+
+        match sqlx::raw_sql(init_sql).execute(&self.pool).await {
+            Ok(_) => {
+                info!("Successfully initialized offset_tracker table");
+                return Ok(());
+            }
+            Err(e) => {
+                // Check if the error is about the tenant_id column not existing
+                let error_msg = e.to_string();
+                if error_msg.contains("column \"tenant_id\" does not exist") {
+                    info!("Detected existing offset_tracker table without tenant_id column, performing migration...");
+
+                    // Perform migration: add tenant_id column and set default values
+                    match self.migrate_offset_tracker_table().await {
+                        Ok(_) => {
+                            info!("Successfully migrated offset_tracker table");
+                            Ok(())
+                        }
+                        Err(migration_err) => {
+                            error!("Failed to migrate offset_tracker table: {}", migration_err);
+                            Err(anyhow!("Failed to migrate offset_tracker table: {}", migration_err))
+                        }
+                    }
+                } else {
+                    error!("Failed to initialize offset_tracker table: {}", e);
+                    Err(anyhow!("Failed to initialize offset_tracker table: {}", e))
+                }
+            }
+        }
+    }
+
+    /// Migrate existing offset_tracker table to include tenant_id column
+    async fn migrate_offset_tracker_table(&self) -> Result<()> {
+        // Add tenant_id column with default value
+        sqlx::query("ALTER TABLE offset_tracker ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'")
             .execute(&self.pool)
             .await
-            .map_err(|e| {
-                error!("Failed to initialize offset_tracker table: {}", e);
-                anyhow!("Failed to initialize offset_tracker table: {}", e)
-            })?;
-        info!("Successfully initialized offset_tracker table");
+            .map_err(|e| anyhow!("Failed to add tenant_id column: {}", e))?;
+
+        // Update the primary key to include tenant_id
+        sqlx::query("ALTER TABLE offset_tracker DROP CONSTRAINT offset_tracker_pkey")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| anyhow!("Failed to drop old primary key: {}", e))?;
+
+        sqlx::query("ALTER TABLE offset_tracker ADD CONSTRAINT offset_tracker_pkey PRIMARY KEY (tenant_id, pipeline_name, topic, partition)")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| anyhow!("Failed to add new primary key: {}", e))?;
+
+        // Recreate indexes with tenant_id
+        sqlx::query("DROP INDEX IF EXISTS idx_offset_tracker_pipeline")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| anyhow!("Failed to drop old pipeline index: {}", e))?;
+
+        sqlx::query("DROP INDEX IF EXISTS idx_offset_tracker_topic")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| anyhow!("Failed to drop old topic index: {}", e))?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_offset_tracker_pipeline ON offset_tracker(tenant_id, pipeline_name)")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| anyhow!("Failed to create new pipeline index: {}", e))?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_offset_tracker_topic ON offset_tracker(tenant_id, topic)")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| anyhow!("Failed to create new topic index: {}", e))?;
+
+        info!("Migration completed: added tenant_id column and updated constraints/indexes");
         Ok(())
     }
 
     /// Read the last committed offset for a partition
     /// Returns the stored offset if exists, None otherwise
     /// Used during consumer startup to seek to the last committed position
+    /// Read the last committed offset for a partition (with tenant support)
+    /// Returns the stored offset if exists, None otherwise
+    /// Used during consumer startup to seek to the last committed position
+    pub async fn read_last_offset_for_tenant(
+        &self,
+        tenant_id: &str,
+        pipeline_name: &str,
+        topic: &str,
+        partition: i32,
+    ) -> Result<Option<i64>> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT \"offset\" FROM offset_tracker 
+             WHERE tenant_id = $1 AND pipeline_name = $2 AND topic = $3 AND partition = $4",
+        )
+        .bind(tenant_id)
+        .bind(pipeline_name)
+        .bind(topic)
+        .bind(partition)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| anyhow!("Failed to read offset: {}", e))?;
+
+        Ok(row.map(|(offset,)| offset))
+    }
+
     #[allow(dead_code)]
     pub async fn read_last_offset(
         &self,
@@ -44,10 +135,12 @@ impl OffsetTracker {
         topic: &str,
         partition: i32,
     ) -> Result<Option<i64>> {
+        // Legacy method - reads without tenant_id (for backward compatibility)
         let row: Option<(i64,)> = sqlx::query_as(
             "SELECT \"offset\" FROM offset_tracker 
-             WHERE pipeline_name = $1 AND topic = $2 AND partition = $3",
+             WHERE tenant_id = 'default' AND pipeline_name = $1 AND topic = $2 AND partition = $3",
         )
+
         .bind(pipeline_name)
         .bind(topic)
         .bind(partition)
@@ -80,12 +173,12 @@ impl OffsetTracker {
         Ok(rows.into_iter().collect())
     }
 
-    /// Write or update the offset for a partition
+    /// Write or update the offset for a partition (with tenant support)
     /// Used in the same transaction as data write for atomic commits
     /// Returns the previous offset (if exists) for metrics/logging
-    #[allow(dead_code)]
-    pub async fn write_offset(
+    pub async fn write_offset_for_tenant(
         &self,
+        tenant_id: &str,
         pipeline_name: &str,
         topic: &str,
         partition: i32,
@@ -100,9 +193,10 @@ impl OffsetTracker {
         // Read current offset (if exists)
         let current: Option<(i64,)> = sqlx::query_as(
             "SELECT \"offset\" FROM offset_tracker 
-             WHERE pipeline_name = $1 AND topic = $2 AND partition = $3
+             WHERE tenant_id = $1 AND pipeline_name = $2 AND topic = $3 AND partition = $4
              FOR UPDATE",
         )
+        .bind(tenant_id)
         .bind(pipeline_name)
         .bind(topic)
         .bind(partition)
@@ -114,11 +208,12 @@ impl OffsetTracker {
 
         // Upsert the new offset
         sqlx::query(
-            "INSERT INTO offset_tracker (pipeline_name, topic, partition, \"offset\", updated_at)
-             VALUES ($1, $2, $3, $4, NOW())
-             ON CONFLICT (pipeline_name, topic, partition)
+            "INSERT INTO offset_tracker (tenant_id, pipeline_name, topic, partition, \"offset\", updated_at)
+             VALUES ($1, $2, $3, $4, $5, NOW())
+             ON CONFLICT (tenant_id, pipeline_name, topic, partition)
              DO UPDATE SET \"offset\" = EXCLUDED.\"offset\", updated_at = NOW()",
         )
+        .bind(tenant_id)
         .bind(pipeline_name)
         .bind(topic)
         .bind(partition)
@@ -130,12 +225,28 @@ impl OffsetTracker {
         tx.commit()
             .await
             .map_err(|e| {
-                error!(pipeline_name, topic, partition, offset, "Failed to commit offset transaction: {}", e);
+                error!(tenant_id, pipeline_name, topic, partition, offset, "Failed to commit offset transaction: {}", e);
                 anyhow!("Failed to commit offset transaction: {}", e)
             })?;
 
-        debug!(pipeline_name, topic, partition, offset, previous_offset, "Successfully wrote offset");
+        debug!(tenant_id, pipeline_name, topic, partition, offset, previous_offset, "Successfully wrote offset");
         Ok(previous_offset)
+    }
+
+    /// Write or update the offset for a partition
+    /// Used in the same transaction as data write for atomic commits
+    /// Returns the previous offset (if exists) for metrics/logging
+    #[allow(dead_code)]
+    pub async fn write_offset(
+        &self,
+        pipeline_name: &str,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+    ) -> Result<Option<i64>> {
+        // Legacy method - writes with default tenant_id
+        self.write_offset_for_tenant("default", pipeline_name, topic, partition, offset)
+            .await
     }
 
     /// Write offset using an existing connection (e.g. inside a transaction)
@@ -143,17 +254,19 @@ impl OffsetTracker {
     /// Used when combining offset write with data write in single transaction
     pub async fn write_offset_with_conn(
         conn: &mut sqlx::PgConnection,
+        tenant_id: &str,
         pipeline_name: &str,
         topic: &str,
         partition: i32,
         offset: i64,
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO offset_tracker (pipeline_name, topic, partition, \"offset\", updated_at)
-             VALUES ($1, $2, $3, $4, NOW())
-             ON CONFLICT (pipeline_name, topic, partition)
+            "INSERT INTO offset_tracker (tenant_id, pipeline_name, topic, partition, \"offset\", updated_at)
+             VALUES ($1, $2, $3, $4, $5, NOW())
+             ON CONFLICT (tenant_id, pipeline_name, topic, partition)
              DO UPDATE SET \"offset\" = EXCLUDED.\"offset\", updated_at = NOW()",
         )
+        .bind(tenant_id)
         .bind(pipeline_name)
         .bind(topic)
         .bind(partition)

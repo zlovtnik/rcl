@@ -69,6 +69,21 @@ pub struct Metrics {
     pub memory_usage_bytes: IntGauge,
     #[allow(dead_code)]
     pub memory_usage_per_pipeline: IntGaugeVec,
+    // Multi-tenancy metrics (Phase 9.2)
+    #[allow(dead_code)]
+    pub tenant_messages_total: IntCounterVec,
+    #[allow(dead_code)]
+    pub tenant_bytes_total: IntCounterVec,
+    #[allow(dead_code)]
+    pub tenant_processing_failures: IntCounterVec,
+    #[allow(dead_code)]
+    pub tenant_dlq_total: IntCounterVec,
+    #[allow(dead_code)]
+    pub tenant_write_latency_seconds: HistogramVec,
+    #[allow(dead_code)]
+    pub tenant_rate_limit_rejections: IntCounterVec,
+    #[allow(dead_code)]
+    pub tenant_rate_limit_tokens_available: IntGaugeVec,
 }
 
 impl Metrics {
@@ -315,6 +330,59 @@ impl Metrics {
         registry.register(Box::new(memory_usage_bytes.clone()))?;
         registry.register(Box::new(memory_usage_per_pipeline.clone()))?;
 
+        // Multi-tenancy metrics (Phase 9.2)
+        let tenant_messages_total = IntCounterVec::new(
+            Opts::new("tenant_messages_total", "Messages processed per tenant"),
+            &["tenant_id"],
+        )?;
+        let tenant_bytes_total = IntCounterVec::new(
+            Opts::new("tenant_bytes_total", "Bytes processed per tenant"),
+            &["tenant_id"],
+        )?;
+        let tenant_processing_failures = IntCounterVec::new(
+            Opts::new(
+                "tenant_processing_failures",
+                "Processing failures per tenant",
+            ),
+            &["tenant_id"],
+        )?;
+        let tenant_dlq_total = IntCounterVec::new(
+            Opts::new("tenant_dlq_total", "Messages sent to DLQ per tenant"),
+            &["tenant_id"],
+        )?;
+        let tenant_write_latency_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "tenant_write_latency_seconds",
+                "Write latency per tenant in seconds",
+            )
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0,
+            ]),
+            &["tenant_id"],
+        )?;
+        let tenant_rate_limit_rejections = IntCounterVec::new(
+            Opts::new(
+                "tenant_rate_limit_rejections",
+                "Rate limit rejections per tenant",
+            ),
+            &["tenant_id"],
+        )?;
+        let tenant_rate_limit_tokens_available = IntGaugeVec::new(
+            Opts::new(
+                "tenant_rate_limit_tokens_available",
+                "Available rate limit tokens per tenant",
+            ),
+            &["tenant_id"],
+        )?;
+
+        registry.register(Box::new(tenant_messages_total.clone()))?;
+        registry.register(Box::new(tenant_bytes_total.clone()))?;
+        registry.register(Box::new(tenant_processing_failures.clone()))?;
+        registry.register(Box::new(tenant_dlq_total.clone()))?;
+        registry.register(Box::new(tenant_write_latency_seconds.clone()))?;
+        registry.register(Box::new(tenant_rate_limit_rejections.clone()))?;
+        registry.register(Box::new(tenant_rate_limit_tokens_available.clone()))?;
+
         Ok(Self {
             messages_total,
             decode_failures,
@@ -345,6 +413,13 @@ impl Metrics {
             write_throughput_records_per_second_per_pipeline,
             memory_usage_bytes,
             memory_usage_per_pipeline,
+            tenant_messages_total,
+            tenant_bytes_total,
+            tenant_processing_failures,
+            tenant_dlq_total,
+            tenant_write_latency_seconds,
+            tenant_rate_limit_rejections,
+            tenant_rate_limit_tokens_available,
         })
     }
 }

@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions, PgSslMode};
 use sqlx::types::Json;
-use sqlx::{PgPool, QueryBuilder};
+use sqlx::{Error as SqlxError, PgPool, QueryBuilder};
 use std::str::FromStr;
 use std::sync::{
     Arc,
@@ -306,7 +306,10 @@ impl Writer {
             *operations_summary
                 .entry(meta.operation.to_string())
                 .or_insert(0) += 1;
-            debug!(operation = %meta.operation, topic = %meta.topic, partition = %meta.partition, offset = %meta.offset, "processing operation");
+            // Only emit per-record debug logs if debug level is enabled to avoid high-throughput overhead
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(operation = %meta.operation, topic = %meta.topic, partition = %meta.partition, offset = %meta.offset, "processing operation");
+            }
         }
 
         info!(batch_size = values.len(), operations = ?operations_summary, "batch composition");
@@ -374,6 +377,7 @@ impl Writer {
 
                         if let Err(e) = OffsetTracker::write_offset_with_conn(
                             &mut tx,
+                            "default",
                             pipeline_name,
                             &topic,
                             partition_i32,
@@ -381,8 +385,17 @@ impl Writer {
                         )
                         .await
                         {
-                            return Err(backoff::Error::transient(ProcessingError::Validation(
-                                ValidationError::new(format!("offset tracking error: {}", e))
+                            // Check if this is a retryable transport error
+                            let error_msg = format!("offset tracking error: {}", e);
+                            if let Ok(sqlx_err) = e.downcast::<SqlxError>() {
+                                let transport_err = TransportError::new("offset tracking", sqlx_err);
+                                if transport_err.is_retryable() {
+                                    return Err(backoff::Error::transient(ProcessingError::from(transport_err)));
+                                }
+                            }
+                            // Not a retryable transport error, treat as permanent validation error
+                            return Err(backoff::Error::permanent(ProcessingError::Validation(
+                                ValidationError::new(error_msg)
                             )));
                         }
                     }

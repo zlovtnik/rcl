@@ -117,13 +117,12 @@ restore: ## Restore data from backup (usage: make restore BACKUP_DIR=backups/202
 	@echo "Restoring MinIO data..."
 	@docker run --rm -v middleware_minio_data:/data -v $(shell pwd)/$(BACKUP_DIR):/backup alpine sh -c "cd /data && tar xzf /backup/minio.tar.gz"
 	@echo "Restore complete. Restart services with 'make up'"
-
 # Portable timeout function for cross-platform compatibility
 # Uses gtimeout (GNU coreutils) if available, otherwise timeout, otherwise shell-based fallback
 define timeout_cmd
 	$(if $(shell command -v gtimeout 2>/dev/null),gtimeout $1 $2, \
 		$(if $(shell command -v timeout 2>/dev/null),timeout $1 $2, \
-			sh -c '$2 & pid=$$!; (sleep $1 && kill $$pid 2>/dev/null &) & killer=$$!; wait $$pid 2>/dev/null; kill $$killer 2>/dev/null; exit $$?' _ ))
+			sh -c '$2 & pid=$!; (sleep $1 && kill $pid 2>/dev/null &) & killer=$!; wait $pid 2>/dev/null; ret=$?; kill $killer 2>/dev/null; exit $ret' _ ))
 endef
 
 # Development helpers

@@ -79,7 +79,7 @@ impl MessageContext {
         }
     }
 
-    /// Creates a correlation identifier combining the message's topic, partition, and offset.
+    /// creates a correlation identifier combining the message's topic, partition, and offset.
     ///
     /// # Returns
     ///
@@ -93,6 +93,20 @@ impl MessageContext {
     /// ```
     pub fn correlation_id(&self) -> String {
         format!("{}:{}:{}", self.topic, self.partition, self.offset)
+    }
+}
+
+/// Multi-tenancy context for message processing
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Hash)]
+pub struct TenantContext {
+    pub tenant_id: String,
+}
+
+impl TenantContext {
+    pub fn new(tenant_id: impl Into<String>) -> Self {
+        Self {
+            tenant_id: tenant_id.into(),
+        }
     }
 }
 
@@ -121,5 +135,18 @@ mod tests {
     fn test_message_context_correlation_id() {
         let ctx = MessageContext::new("topic".to_string(), 1, 42, 0, None);
         assert_eq!(ctx.correlation_id(), "topic:1:42");
+    }
+
+    #[test]
+    fn test_tenant_context_creation() {
+        let tenant = TenantContext::new("tenant-123");
+        assert_eq!(tenant.tenant_id, "tenant-123");
+    }
+
+    #[test]
+    fn test_tenant_context_equality() {
+        let tenant1 = TenantContext::new("tenant-123");
+        let tenant2 = TenantContext::new("tenant-123");
+        assert_eq!(tenant1, tenant2);
     }
 }

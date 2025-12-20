@@ -16,6 +16,15 @@ pub enum LogLevel {
     Error,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CopyFormat {
+    #[default]
+    Csv,
+    Binary,
+    Text,
+}
+
 impl std::fmt::Display for LogLevel {
     /// Formats a `LogLevel` as its lowercase textual representation.
     ///
@@ -84,10 +93,6 @@ impl Default for MemoryConfig {
             memory_check_interval_ms: default_memory_check_interval_ms(),
         }
     }
-}
-
-fn default_copy_format() -> String {
-    "csv".to_string()
 }
 
 fn default_copy_buffer_size() -> usize {
@@ -232,7 +237,10 @@ mod tests {
                 max_connections: 10,
                 acquire_timeout_ms: 5000,
             }),
+            per_pipeline_pools: false,
             copy_enabled: true,
+            copy_format: CopyFormat::Csv,
+            copy_buffer_size: 65536,
             copy_batch_rows: 1000,
             insert_batch_rows: 100,
             enable_offset_tracking: false,
@@ -250,7 +258,28 @@ mod tests {
                 max_connections: 0,
                 acquire_timeout_ms: 10000,
             }),
+            per_pipeline_pools: false,
             copy_enabled: true,
+            copy_format: CopyFormat::Csv,
+            copy_buffer_size: 65536,
+            copy_batch_rows: 1000,
+            insert_batch_rows: 100,
+            enable_offset_tracking: false,
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_postgres_config_validation_zero_copy_buffer_size() {
+        let cfg = PostgresConfig {
+            url: "postgres://localhost/db".to_string(),
+            ssl_mode: None,
+            ssl_root_cert: None,
+            pool: None,
+            per_pipeline_pools: false,
+            copy_enabled: true,
+            copy_format: CopyFormat::Csv,
+            copy_buffer_size: 0,
             copy_batch_rows: 1000,
             insert_batch_rows: 100,
             enable_offset_tracking: false,
@@ -383,6 +412,20 @@ mod tests {
     fn test_config_validation_zero_health_check_timeout() {
         let mut cfg = create_valid_config();
         cfg.service.health_check_timeout_ms = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_zero_max_memory_mb() {
+        let mut cfg = create_valid_config();
+        cfg.service.memory.max_memory_mb = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_zero_memory_check_interval_ms() {
+        let mut cfg = create_valid_config();
+        cfg.service.memory.memory_check_interval_ms = 0;
         assert!(cfg.validate().is_err());
     }
 
@@ -543,7 +586,10 @@ mod tests {
                     max_connections: 10,
                     acquire_timeout_ms: 5000,
                 }),
+                per_pipeline_pools: false,
                 copy_enabled: true,
+                copy_format: CopyFormat::Csv,
+                copy_buffer_size: 65536,
                 copy_batch_rows: 5000,
                 insert_batch_rows: 500,
                 enable_offset_tracking: false,
@@ -563,6 +609,7 @@ mod tests {
                 batching: Default::default(),
                 circuit_breaker: Default::default(),
                 worker_threads: 1,
+                multi_tenancy: None,
             }],
         }
     }
@@ -650,8 +697,8 @@ pub struct PostgresConfig {
     #[serde(default)]
     pub per_pipeline_pools: bool,
     pub copy_enabled: bool,
-    #[serde(default = "default_copy_format")]
-    pub copy_format: String,
+    #[serde(default)]
+    pub copy_format: CopyFormat,
     #[serde(default = "default_copy_buffer_size")]
     pub copy_buffer_size: usize,
     pub copy_batch_rows: usize,
@@ -687,6 +734,12 @@ impl PostgresConfig {
         if let Some(ref pool) = self.pool {
             pool.validate()?;
         }
+
+        ensure!(
+            self.copy_buffer_size > 0,
+            "copy_buffer_size must be greater than 0"
+        );
+
         Ok(())
     }
 }
@@ -776,6 +829,16 @@ impl Config {
         ensure!(
             self.service.health_check_timeout_ms > 0,
             "health_check_timeout_ms must be greater than 0"
+        );
+
+        ensure!(
+            self.service.memory.max_memory_mb > 0,
+            "service.memory.max_memory_mb must be greater than 0"
+        );
+
+        ensure!(
+            self.service.memory.memory_check_interval_ms > 0,
+            "service.memory.memory_check_interval_ms must be greater than 0"
         );
 
         ensure!(
@@ -928,4 +991,126 @@ pub fn validate_table_identifier(table: &str) -> Result<&str> {
     }
 
     Ok(table)
+}
+
+/// Validate a tenant identifier for safe use in table name construction.
+///
+/// Tenant IDs are used as suffixes in table names (e.g., "users_tenant123").
+/// They must be safe for concatenation and SQL identifier use.
+///
+/// # Parameters
+///
+/// - `tenant_id`: The tenant identifier string to validate
+///
+/// # Returns
+///
+/// `Ok(&str)` with the validated tenant ID if valid, `Err` with a descriptive error if invalid.
+///
+/// # Validation Rules
+///
+/// - Must not be empty
+/// - Must be <= 32 characters (reasonable limit for tenant IDs)
+/// - Must start with a letter or underscore
+/// - Must contain only ASCII alphanumeric characters and underscores
+/// - Must not contain SQL injection characters (no quotes, semicolons, etc.)
+///
+/// # Examples
+///
+/// ```
+/// assert!(validate_tenant_identifier("tenant123").is_ok());
+/// assert!(validate_tenant_identifier("tenant_123").is_ok());
+/// assert!(validate_tenant_identifier("_tenant").is_ok());
+/// assert!(validate_tenant_identifier("").is_err()); // empty
+/// assert!(validate_tenant_identifier("123tenant").is_err()); // starts with number
+/// assert!(validate_tenant_identifier("tenant-123").is_err()); // dash not allowed
+/// assert!(validate_tenant_identifier("tenant;drop").is_err()); // injection attempt
+/// ```
+pub fn validate_tenant_identifier(tenant_id: &str) -> Result<&str> {
+    if tenant_id.is_empty() {
+        bail!("tenant_id must not be empty");
+    }
+
+    if tenant_id.len() > 32 {
+        bail!("tenant_id must be <= 32 characters");
+    }
+
+    let mut chars = tenant_id.chars();
+    let first = match chars.next() {
+        Some(c) => c,
+        None => return Ok(tenant_id), // This shouldn't happen due to empty check above
+    };
+
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        bail!(
+            "tenant_id must start with a letter or underscore, contain only alphanumerics/underscores"
+        );
+    }
+
+    if !chars.all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+        bail!(
+            "tenant_id must contain only ASCII alphanumeric characters and underscores"
+        );
+    }
+
+    // Additional SQL injection protection
+    if tenant_id.contains('\'') || tenant_id.contains('"') || tenant_id.contains(';') ||
+       tenant_id.contains('\\') || tenant_id.contains('\n') || tenant_id.contains('\r') ||
+       tenant_id.contains('\t') {
+        bail!("tenant_id contains invalid characters");
+    }
+
+    Ok(tenant_id)
+}
+
+#[cfg(test)]
+mod tenant_validation_tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_tenant_identifier_valid() {
+        assert!(validate_tenant_identifier("tenant123").is_ok());
+        assert!(validate_tenant_identifier("tenant_123").is_ok());
+        assert!(validate_tenant_identifier("_tenant").is_ok());
+        assert!(validate_tenant_identifier("a").is_ok());
+        assert!(validate_tenant_identifier("tenant").is_ok());
+        assert!(validate_tenant_identifier("TENANT").is_ok());
+    }
+
+    #[test]
+    fn test_validate_tenant_identifier_empty() {
+        assert!(validate_tenant_identifier("").is_err());
+    }
+
+    #[test]
+    fn test_validate_tenant_identifier_too_long() {
+        let long_id = "a".repeat(33);
+        assert!(validate_tenant_identifier(&long_id).is_err());
+    }
+
+    #[test]
+    fn test_validate_tenant_identifier_invalid_start() {
+        assert!(validate_tenant_identifier("123tenant").is_err());
+        assert!(validate_tenant_identifier("-tenant").is_err());
+        assert!(validate_tenant_identifier(" tenant").is_err());
+    }
+
+    #[test]
+    fn test_validate_tenant_identifier_invalid_chars() {
+        assert!(validate_tenant_identifier("tenant-123").is_err()); // dash
+        assert!(validate_tenant_identifier("tenant 123").is_err()); // space
+        assert!(validate_tenant_identifier("tenant.123").is_err()); // dot
+        assert!(validate_tenant_identifier("tenant/123").is_err()); // slash
+        assert!(validate_tenant_identifier("tenant@123").is_err()); // at
+    }
+
+    #[test]
+    fn test_validate_tenant_identifier_sql_injection() {
+        assert!(validate_tenant_identifier("tenant;drop").is_err()); // semicolon
+        assert!(validate_tenant_identifier("tenant'drop").is_err()); // quote
+        assert!(validate_tenant_identifier("tenant\"drop").is_err()); // double quote
+        assert!(validate_tenant_identifier("tenant\\drop").is_err()); // backslash
+        assert!(validate_tenant_identifier("tenant\ndrop").is_err()); // newline
+        assert!(validate_tenant_identifier("tenant\rdrop").is_err()); // carriage return
+        assert!(validate_tenant_identifier("tenant\tdrop").is_err()); // tab
+    }
 }

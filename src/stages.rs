@@ -1,3 +1,4 @@
+use crate::config::validate_tenant_identifier;
 use crate::eip::{Stage, StageContext, StageError, StageResult};
 use crate::errors::{ProcessingError, ValidationError};
 use anyhow::Result;
@@ -709,7 +710,133 @@ impl Stage for RouterStage {
     }
 }
 
-/// Splitter Stage - Split one message into many
+/// Tenant Router Stage - Routes messages to tenant-specific staging tables
+///
+/// Enables multi-tenant support by:
+/// 1. Extracting tenant_id from messages
+/// 2. Optionally appending tenant_id to table name (e.g., stg_orders -> stg_orders_acme)
+/// 3. Injecting tenant_id and table destination into message metadata
+#[derive(Debug)]
+pub struct TenantRouterStage {
+    #[allow(dead_code)]
+    name: String,
+    tenant_field: String,
+    staging_table: String,
+    table_suffix_enabled: bool,
+    table_suffix_prefix: String,
+    metadata_field: String,
+    tenant_metadata_field: String,
+}
+
+impl TenantRouterStage {
+    pub fn from_config(name: String, config: Value) -> Result<Self> {
+        let tenant_field = config
+            .get("tenant_field")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing tenant_field"))?
+            .to_string();
+
+        let staging_table = config
+            .get("staging_table")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing staging_table"))?
+            .to_string();
+
+        let table_suffix_enabled = config
+            .get("table_suffix_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let table_suffix_prefix = config
+            .get("table_suffix_prefix")
+            .and_then(|v| v.as_str())
+            .unwrap_or("_")
+            .to_string();
+
+        let metadata_field = config
+            .get("metadata_field")
+            .and_then(|v| v.as_str())
+            .unwrap_or("_destination_table")
+            .to_string();
+
+        let tenant_metadata_field = config
+            .get("tenant_metadata_field")
+            .and_then(|v| v.as_str())
+            .unwrap_or("_tenant_id")
+            .to_string();
+
+        Ok(Self {
+            name,
+            tenant_field,
+            staging_table,
+            table_suffix_enabled,
+            table_suffix_prefix,
+            metadata_field,
+            tenant_metadata_field,
+        })
+    }
+}
+
+#[async_trait]
+impl Stage for TenantRouterStage {
+    async fn process(
+        &self,
+        _ctx: &StageContext,
+        mut msg: Value,
+    ) -> Result<StageResult, ProcessingError> {
+        // Extract tenant ID from message
+        let tenant_id = get_field(&msg, &self.tenant_field)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ProcessingError::Stage(StageError::new(
+                    "tenant_routing_error",
+                    format!("tenant field '{}' not found or not a string", self.tenant_field),
+                ))
+            })?
+            .to_string();
+
+        // Validate tenant ID to prevent SQL injection
+        validate_tenant_identifier(&tenant_id).map_err(|e| {
+            ProcessingError::Stage(StageError::new(
+                "tenant_validation_error",
+                format!("invalid tenant_id '{}': {}", tenant_id, e),
+            ))
+        })?;
+
+        // Determine destination table
+        let destination_table = if self.table_suffix_enabled {
+            format!(
+                "{}{}{}",
+                self.staging_table, self.table_suffix_prefix, tenant_id
+            )
+        } else {
+            self.staging_table.clone()
+        };
+
+        // Inject destination table into metadata
+        set_field(
+            &mut msg,
+            &self.metadata_field,
+            Value::String(destination_table),
+        )
+        .map_err(|e| ProcessingError::Stage(StageError::new("field_error", e.to_string())))?;
+
+        // Inject tenant ID into metadata
+        set_field(
+            &mut msg,
+            &self.tenant_metadata_field,
+            Value::String(tenant_id),
+        )
+        .map_err(|e| ProcessingError::Stage(StageError::new("field_error", e.to_string())))?;
+
+        Ok(StageResult::Continue(msg))
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 #[derive(Debug)]
 pub struct SplitterStage {
     #[allow(dead_code)]

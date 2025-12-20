@@ -1,4 +1,5 @@
 mod batcher;
+mod chaos_tests;
 mod circuit_breaker;
 mod config;
 mod consumer;
@@ -12,6 +13,7 @@ mod load_test;
 mod logging;
 mod metrics;
 mod offset_tracker;
+mod rate_limiter;
 mod retry;
 mod shutdown;
 mod stages;
@@ -68,8 +70,8 @@ enum Commands {
         rate: u32,
         #[arg(short, long, default_value_t = 60)]
         duration_sec: u64,
-        #[arg(short, long, default_value_t = 1)]
-        producers: usize,
+        #[arg(short, long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=100))]
+        producers: u32,
     },
 }
 

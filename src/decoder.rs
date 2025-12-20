@@ -15,11 +15,7 @@ pub fn decode_and_validate(
     if pipeline.debezium_envelope {
         debug!(pipeline = %pipeline.name, "unwrapping Debezium envelope");
         value = unwrap_debezium(value)?;
-        if let Some(op) = value.get("operation_type") {
-            info!(pipeline = %pipeline.name, operation = %op, "decoded Debezium message");
-        }
-    } else {
-        debug!(pipeline = %pipeline.name, "no Debezium envelope configured");
+        debug!(pipeline = %pipeline.name, operation = %value["operation_type"], "decoded Debezium message");
     }
 
     validate_required_fields(&value, pipeline)?;
@@ -143,6 +139,7 @@ mod tests {
             batching: Default::default(),
             circuit_breaker: Default::default(),
             worker_threads: 1,
+            multi_tenancy: None,
         }
     }
 

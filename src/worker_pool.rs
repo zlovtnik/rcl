@@ -186,7 +186,7 @@ impl WorkerPoolBuilder {
         WorkerPoolCoordinator {
             num_workers: self.num_workers,
             worker_senders: worker_txs,
-            worker_receivers: worker_rxs,
+            worker_receivers: Some(worker_rxs),
             offset_tracker,
             metrics,
             next_worker: Arc::new(Mutex::new(0)),
@@ -198,7 +198,7 @@ impl WorkerPoolBuilder {
 pub struct WorkerPoolCoordinator {
     num_workers: usize,
     worker_senders: Vec<mpsc::Sender<Vec<u8>>>,
-    worker_receivers: Vec<mpsc::Receiver<Vec<u8>>>,
+    worker_receivers: Option<Vec<mpsc::Receiver<Vec<u8>>>>,
     pub offset_tracker: OffsetTracker,
     pub metrics: WorkerPoolMetrics,
     next_worker: Arc<Mutex<usize>>,
@@ -238,9 +238,8 @@ impl WorkerPoolCoordinator {
     }
 
     /// Get the worker receivers (consumes them - call this once to spawn workers)
-    pub fn take_receivers(&mut self) -> Vec<mpsc::Receiver<Vec<u8>>> {
-        // Take the existing receivers and replace with empty vec
-        std::mem::take(&mut self.worker_receivers)
+    pub fn take_receivers(&mut self) -> Option<Vec<mpsc::Receiver<Vec<u8>>>> {
+        self.worker_receivers.take()
     }
 }
 
@@ -255,7 +254,7 @@ mod tests {
         // Mark offsets out of order
         assert!(tracker.mark_processed(0).await); // Advances frontier: next=0→1
         assert!(!tracker.mark_processed(2).await); // Out of order, doesn't advance: pending={2}
-        assert!(!tracker.mark_processed(1).await); // Fills gap and advances past 2: next becomes 3
+        assert!(tracker.mark_processed(1).await); // Fills gap and advances past 2: next becomes 3
 
         // Now 0, 1, and 2 are all committed
         assert_eq!(tracker.get_committable_offset().await, 2);
