@@ -255,7 +255,9 @@ async fn run_memory_monitor_task(
     memory_config: crate::config::MemoryConfig,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
-    let mut interval = interval(Duration::from_millis(memory_config.memory_check_interval_ms));
+    let mut interval = interval(Duration::from_millis(
+        memory_config.memory_check_interval_ms,
+    ));
     loop {
         tokio::select! {
             _ = shutdown_rx.recv() => {
@@ -299,7 +301,10 @@ async fn run_pipeline_processing_loop(
 
     while let Some((ctx, msg)) = stream.next().await {
         // Decrement channel depth metric on message receipt
-        let gauge = context.metrics.channel_depth_per_pipeline.with_label_values(&[&pipeline.name]);
+        let gauge = context
+            .metrics
+            .channel_depth_per_pipeline
+            .with_label_values(&[&pipeline.name]);
         gauge.dec();
 
         // Check circuit breaker before processing
@@ -931,7 +936,10 @@ pub async fn run(
         topic_to_pipeline.insert(topic.clone(), pipeline_name.clone());
 
         // Initialize channel depth metric to 0
-        metrics.channel_depth_per_pipeline.with_label_values(&[&pipeline_name]).set(0);
+        metrics
+            .channel_depth_per_pipeline
+            .with_label_values(&[&pipeline_name])
+            .set(0);
 
         // Create batcher for this pipeline
         let batcher_config = BatcherConfig::from_pipeline_config(
@@ -1064,7 +1072,12 @@ pub async fn run(
     ));
 
     // Wait for fetch and heartbeat to complete, then join all processing tasks
-    let _ = tokio::join!(fetch_loop, heartbeat_task, circuit_breaker_metrics_task, memory_monitor_task);
+    let _ = tokio::join!(
+        fetch_loop,
+        heartbeat_task,
+        circuit_breaker_metrics_task,
+        memory_monitor_task
+    );
 
     for task in processing_tasks {
         let _ = task.await;

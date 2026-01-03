@@ -2,7 +2,7 @@ use crate::eip::PipelineConfig;
 use crate::errors::{DebeziumError, ProcessingError, ValidationError};
 use crate::types::Operation;
 use serde_json::Value;
-use tracing::{debug, info};
+use tracing::debug;
 
 pub fn decode_and_validate(
     payload: &[u8],

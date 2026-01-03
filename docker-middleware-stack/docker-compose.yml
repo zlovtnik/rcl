@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # Zookeeper (Required for Kafka)
   zookeeper:
@@ -92,9 +90,6 @@ services:
       - schema-registry
     ports:
       - "5556:5556"
-    environment:
-      JMX_USERNAME: ${JMX_USERNAME}
-      JMX_PASSWORD: ${JMX_PASSWORD}
     volumes:
       - ./configs/schema-registry/jmx_exporter_config.yml:/opt/bitnami/jmx-exporter/config.yml
     command: ["5556", "/opt/bitnami/jmx-exporter/config.yml"]

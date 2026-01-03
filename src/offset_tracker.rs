@@ -4,7 +4,7 @@
 use anyhow::{Result, anyhow};
 use sqlx::PgPool;
 use std::collections::BTreeMap;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// OffsetTracker manages Kafka offset commits to a database table
 /// Enables exactly-once processing by persisting offsets alongside data writes
@@ -35,7 +35,9 @@ impl OffsetTracker {
                 // Check if the error is about the tenant_id column not existing
                 let error_msg = e.to_string();
                 if error_msg.contains("column \"tenant_id\" does not exist") {
-                    info!("Detected existing offset_tracker table without tenant_id column, performing migration...");
+                    info!(
+                        "Detected existing offset_tracker table without tenant_id column, performing migration..."
+                    );
 
                     // Perform migration: add tenant_id column and set default values
                     match self.migrate_offset_tracker_table().await {
@@ -45,7 +47,10 @@ impl OffsetTracker {
                         }
                         Err(migration_err) => {
                             error!("Failed to migrate offset_tracker table: {}", migration_err);
-                            Err(anyhow!("Failed to migrate offset_tracker table: {}", migration_err))
+                            Err(anyhow!(
+                                "Failed to migrate offset_tracker table: {}",
+                                migration_err
+                            ))
                         }
                     }
                 } else {
@@ -59,10 +64,12 @@ impl OffsetTracker {
     /// Migrate existing offset_tracker table to include tenant_id column
     async fn migrate_offset_tracker_table(&self) -> Result<()> {
         // Add tenant_id column with default value
-        sqlx::query("ALTER TABLE offset_tracker ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'")
-            .execute(&self.pool)
-            .await
-            .map_err(|e| anyhow!("Failed to add tenant_id column: {}", e))?;
+        sqlx::query(
+            "ALTER TABLE offset_tracker ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| anyhow!("Failed to add tenant_id column: {}", e))?;
 
         // Update the primary key to include tenant_id
         sqlx::query("ALTER TABLE offset_tracker DROP CONSTRAINT offset_tracker_pkey")
@@ -140,7 +147,6 @@ impl OffsetTracker {
             "SELECT \"offset\" FROM offset_tracker 
              WHERE tenant_id = 'default' AND pipeline_name = $1 AND topic = $2 AND partition = $3",
         )
-
         .bind(pipeline_name)
         .bind(topic)
         .bind(partition)
@@ -222,14 +228,23 @@ impl OffsetTracker {
         .await
         .map_err(|e| anyhow!("Failed to write offset: {}", e))?;
 
-        tx.commit()
-            .await
-            .map_err(|e| {
-                error!(tenant_id, pipeline_name, topic, partition, offset, "Failed to commit offset transaction: {}", e);
-                anyhow!("Failed to commit offset transaction: {}", e)
-            })?;
+        tx.commit().await.map_err(|e| {
+            error!(
+                tenant_id,
+                pipeline_name,
+                topic,
+                partition,
+                offset,
+                "Failed to commit offset transaction: {}",
+                e
+            );
+            anyhow!("Failed to commit offset transaction: {}", e)
+        })?;
 
-        debug!(tenant_id, pipeline_name, topic, partition, offset, previous_offset, "Successfully wrote offset");
+        debug!(
+            tenant_id,
+            pipeline_name, topic, partition, offset, previous_offset, "Successfully wrote offset"
+        );
         Ok(previous_offset)
     }
 
@@ -291,7 +306,10 @@ impl OffsetTracker {
             })?;
 
         let deleted_count = result.rows_affected();
-        info!(pipeline_name, deleted_count, "Successfully deleted pipeline offsets");
+        info!(
+            pipeline_name,
+            deleted_count, "Successfully deleted pipeline offsets"
+        );
         Ok(deleted_count)
     }
 

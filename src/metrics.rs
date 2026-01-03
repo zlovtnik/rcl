@@ -312,7 +312,9 @@ impl Metrics {
         registry.register(Box::new(retry_attempts_per_pipeline.clone()))?;
         registry.register(Box::new(circuit_breaker_state_per_pipeline.clone()))?;
         registry.register(Box::new(inflight_batches_per_pipeline.clone()))?;
-        registry.register(Box::new(write_throughput_records_per_second_per_pipeline.clone()))?;
+        registry.register(Box::new(
+            write_throughput_records_per_second_per_pipeline.clone(),
+        ))?;
 
         // Memory management metrics
         let memory_usage_bytes = IntGauge::new(

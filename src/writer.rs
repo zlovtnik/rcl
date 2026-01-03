@@ -246,6 +246,8 @@ impl Writer {
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
             .acquire_timeout(acquire_timeout)
+            .idle_timeout(Duration::from_secs(30)) // Close idle connections after 30s
+            .max_lifetime(Duration::from_secs(300)) // Force connection cycling every 5 minutes
             .connect_with(options)
             .await
             .map_err(|e| {
@@ -339,13 +341,48 @@ impl Writer {
                         Ok(())
                     }
                     Err(err) => {
+                        // Check if this is an aborted transaction error
+                        let err_msg = err.to_string();
+                        if err_msg.contains("current transaction is aborted") {
+                            warn!(table = %table, error = %err, "transaction aborted during COPY, will retry with fresh transaction");
+                            // Return a special error that indicates we should retry with a fresh connection
+                            return Err(backoff::Error::transient(ProcessingError::from(
+                                TransportError::new("transaction aborted", SqlxError::Protocol("transaction aborted".to_string()))
+                            )));
+                        }
                         warn!(table = %table, error = %err, "COPY failed, falling back to INSERT");
-                        insert_batch(&mut tx, table, values).await
+                        match insert_batch(&mut tx, table, values).await {
+                            Ok(_) => Ok(()),
+                            Err(insert_err) => {
+                                // Check if INSERT also failed due to aborted transaction
+                                let insert_err_msg = insert_err.to_string();
+                                if insert_err_msg.contains("current transaction is aborted") {
+                                    warn!(table = %table, error = %insert_err, "transaction aborted during INSERT, will retry with fresh transaction");
+                                    return Err(backoff::Error::transient(ProcessingError::from(
+                                        TransportError::new("transaction aborted", SqlxError::Protocol("transaction aborted".to_string()))
+                                    )));
+                                }
+                                Err(insert_err)
+                            }
+                        }
                     }
                 }
             } else {
                 debug!(table = %table, "using INSERT batch insert");
-                insert_batch(&mut tx, table, values).await
+                match insert_batch(&mut tx, table, values).await {
+                    Ok(_) => Ok(()),
+                    Err(err) => {
+                        // Check if this is an aborted transaction error
+                        let err_msg = err.to_string();
+                        if err_msg.contains("current transaction is aborted") {
+                            warn!(table = %table, error = %err, "transaction aborted during INSERT, will retry with fresh transaction");
+                            return Err(backoff::Error::transient(ProcessingError::from(
+                                TransportError::new("transaction aborted", SqlxError::Protocol("transaction aborted".to_string()))
+                            )));
+                        }
+                        Err(err)
+                    }
+                }
             };
 
             match res {
@@ -388,14 +425,17 @@ impl Writer {
                             // Check if this is a retryable transport error
                             let error_msg = format!("offset tracking error: {}", e);
                             if let Ok(sqlx_err) = e.downcast::<SqlxError>() {
-                                let transport_err = TransportError::new("offset tracking", sqlx_err);
+                                let transport_err =
+                                    TransportError::new("offset tracking", sqlx_err);
                                 if transport_err.is_retryable() {
-                                    return Err(backoff::Error::transient(ProcessingError::from(transport_err)));
+                                    return Err(backoff::Error::transient(ProcessingError::from(
+                                        transport_err,
+                                    )));
                                 }
                             }
                             // Not a retryable transport error, treat as permanent validation error
                             return Err(backoff::Error::permanent(ProcessingError::Validation(
-                                ValidationError::new(error_msg)
+                                ValidationError::new(error_msg),
                             )));
                         }
                     }
@@ -483,11 +523,9 @@ async fn copy_into(
     validate_table_identifier(table)
         .map_err(|e| ProcessingError::Validation(ValidationError::new(e.to_string())))?;
 
-    // Escape any double quotes in table name and wrap in quotes for safe SQL identifier
-    let quoted_table = format!("\"{}\"", table.replace('"', "\"\""));
     let copy_sql = format!(
         "COPY {} (payload, ingest_system_time, _meta_topic, _meta_partition, _meta_offset, _meta_ingest_ts) FROM STDIN WITH (FORMAT csv)",
-        quoted_table
+        table
     );
     let mut writer = conn
         .copy_in_raw(&copy_sql)
@@ -543,11 +581,9 @@ async fn insert_batch(
     validate_table_identifier(table)
         .map_err(|e| ProcessingError::Validation(ValidationError::new(e.to_string())))?;
 
-    // Escape any double quotes in table name and wrap in quotes for safe SQL identifier
-    let quoted_table = format!("\"{}\"", table.replace('"', "\"\""));
     let mut builder = QueryBuilder::new(format!(
         "INSERT INTO {} (payload, ingest_system_time, _meta_topic, _meta_partition, _meta_offset, _meta_ingest_ts) ",
-        quoted_table
+        table
     ));
 
     builder.push_values(values, |mut b, val| {

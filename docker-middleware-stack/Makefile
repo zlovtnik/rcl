@@ -14,7 +14,7 @@ help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-15s %s\n", $$1, $$2}'
 
 # Development commands
-up: check-env ## Start all services
+up: ## Start all services
 	docker-compose up -d
 
 up-build: ## Start all services and rebuild images

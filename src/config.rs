@@ -1047,15 +1047,18 @@ pub fn validate_tenant_identifier(tenant_id: &str) -> Result<&str> {
     }
 
     if !chars.all(|c| c == '_' || c.is_ascii_alphanumeric()) {
-        bail!(
-            "tenant_id must contain only ASCII alphanumeric characters and underscores"
-        );
+        bail!("tenant_id must contain only ASCII alphanumeric characters and underscores");
     }
 
     // Additional SQL injection protection
-    if tenant_id.contains('\'') || tenant_id.contains('"') || tenant_id.contains(';') ||
-       tenant_id.contains('\\') || tenant_id.contains('\n') || tenant_id.contains('\r') ||
-       tenant_id.contains('\t') {
+    if tenant_id.contains('\'')
+        || tenant_id.contains('"')
+        || tenant_id.contains(';')
+        || tenant_id.contains('\\')
+        || tenant_id.contains('\n')
+        || tenant_id.contains('\r')
+        || tenant_id.contains('\t')
+    {
         bail!("tenant_id contains invalid characters");
     }
 

@@ -1,11 +1,9 @@
 /// Per-tenant rate limiting for multi-tenancy support
 /// Implements token bucket algorithm for fair rate limiting across tenants
-
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tracing::debug;
 
 /// Rate limiter configuration for a tenant
 #[derive(Clone, Debug)]
@@ -135,9 +133,9 @@ impl TenantRateLimiter {
         // Acquire buckets first to maintain consistent lock ordering
         let mut buckets = self.buckets.lock().unwrap();
         let mut configs = self.tenant_configs.lock().unwrap();
-        
+
         configs.insert(tenant_id.clone(), config.clone());
-        
+
         if let Some(bucket) = buckets.get_mut(&tenant_id) {
             *bucket = TokenBucket::new(config);
         }
@@ -153,9 +151,9 @@ impl TenantRateLimiter {
         let mut buckets = self.buckets.lock().unwrap();
 
         // Get or create bucket for this tenant
-        let bucket = buckets.entry(tenant_id.to_string()).or_insert_with(|| {
-            TokenBucket::new(config)
-        });
+        let bucket = buckets
+            .entry(tenant_id.to_string())
+            .or_insert_with(|| TokenBucket::new(config));
 
         Ok(bucket.allow(message_size_bytes))
     }
@@ -167,9 +165,9 @@ impl TenantRateLimiter {
 
         let mut buckets = self.buckets.lock().unwrap();
 
-        let bucket = buckets.entry(tenant_id.to_string()).or_insert_with(|| {
-            TokenBucket::new(config)
-        });
+        let bucket = buckets
+            .entry(tenant_id.to_string())
+            .or_insert_with(|| TokenBucket::new(config));
 
         let message_tokens = bucket.message_tokens_available();
         let byte_tokens = bucket.byte_tokens_available();

@@ -9,10 +9,9 @@
 ///
 /// Scenarios are orchestrated via CLI commands and Docker container manipulation.
 /// Real failures are induced on the middleware stack (Kafka, Postgres, network).
-
 use crate::{
     config::ServiceConfig,
-    health::{HealthRegistry, ComponentStatus},
+    health::{ComponentStatus, HealthRegistry},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -22,15 +21,15 @@ use tracing::{error, info, warn};
 /// Chaos test scenario types
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum ChaosScenario {
-    KafkaBrokerKill,           // Kill one Kafka broker mid-consume
-    KafkaBrokerRestart,        // Kill and restart broker
-    PostgresConnectionPool,    // Exhaust Postgres connection pool
-    PostgresSlowWrites,        // Inject latency into Postgres writes
-    NetworkPartition,          // Partition service from Kafka/Postgres
-    NetworkLatency,            // Add network delay (100-500ms)
-    ServiceRestart,            // Kill and restart the service
-    OutOfOrderMessages,        // Consume messages out of order
-    CascadingFailures,         // Multiple failures in sequence
+    KafkaBrokerKill,        // Kill one Kafka broker mid-consume
+    KafkaBrokerRestart,     // Kill and restart broker
+    PostgresConnectionPool, // Exhaust Postgres connection pool
+    PostgresSlowWrites,     // Inject latency into Postgres writes
+    NetworkPartition,       // Partition service from Kafka/Postgres
+    NetworkLatency,         // Add network delay (100-500ms)
+    ServiceRestart,         // Kill and restart the service
+    OutOfOrderMessages,     // Consume messages out of order
+    CascadingFailures,      // Multiple failures in sequence
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,8 +63,15 @@ impl ChaosTestRunner {
     }
 
     /// Run a chaos test scenario
-    pub async fn run_scenario(&self, scenario: ChaosScenario, duration_secs: u64) -> anyhow::Result<ChaosTestResult> {
-        info!("Starting chaos test scenario: {:?} for {} seconds", scenario, duration_secs);
+    pub async fn run_scenario(
+        &self,
+        scenario: ChaosScenario,
+        duration_secs: u64,
+    ) -> anyhow::Result<ChaosTestResult> {
+        info!(
+            "Starting chaos test scenario: {:?} for {} seconds",
+            scenario, duration_secs
+        );
 
         let start = SystemTime::now();
         let scenario_name = format!("{:?}", scenario);
@@ -152,7 +158,10 @@ impl ChaosTestRunner {
             scenario: scenario_name,
             duration_secs: duration,
             messages_sent: final_metrics.get("messages_sent").copied().unwrap_or(0),
-            messages_delivered: final_metrics.get("messages_delivered").copied().unwrap_or(0),
+            messages_delivered: final_metrics
+                .get("messages_delivered")
+                .copied()
+                .unwrap_or(0),
             messages_in_dlq: final_metrics.get("dlq_messages").copied().unwrap_or(0),
             duplicates_detected: final_metrics.get("duplicates").copied().unwrap_or(0),
             data_loss_detected: final_metrics.get("data_loss").copied().unwrap_or(0) > 0,
@@ -180,7 +189,7 @@ impl ChaosTestRunner {
 
     /// Capture final metrics after recovery
     fn capture_final_metrics(&self, baseline: &HashMap<String, u64>) -> HashMap<String, u64> {
-        let mut metrics = baseline.clone();
+        let metrics = baseline.clone();
         // In real implementation, query Prometheus for:
         // - messages_total (per topic)
         // - dlq_total (dead-letter queue depth)
@@ -190,7 +199,11 @@ impl ChaosTestRunner {
     }
 
     /// Validate test results against expected behavior
-    fn validate_test_results(&self, scenario: &ChaosScenario, metrics: &HashMap<String, u64>) -> bool {
+    fn validate_test_results(
+        &self,
+        scenario: &ChaosScenario,
+        metrics: &HashMap<String, u64>,
+    ) -> bool {
         match scenario {
             ChaosScenario::KafkaBrokerKill => {
                 // Should see increased lag but no data loss
@@ -326,7 +339,9 @@ impl ChaosTestRunner {
         let max_retries = 60; // 60 seconds
         for i in 0..max_retries {
             let health = self.health_registry.get_status();
-            if health.kafka == ComponentStatus::Healthy && health.postgres == ComponentStatus::Healthy {
+            if health.kafka == ComponentStatus::Healthy
+                && health.postgres == ComponentStatus::Healthy
+            {
                 info!("System recovered after {} seconds", i);
                 return Ok(());
             }

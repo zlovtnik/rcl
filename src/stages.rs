@@ -790,7 +790,10 @@ impl Stage for TenantRouterStage {
             .ok_or_else(|| {
                 ProcessingError::Stage(StageError::new(
                     "tenant_routing_error",
-                    format!("tenant field '{}' not found or not a string", self.tenant_field),
+                    format!(
+                        "tenant field '{}' not found or not a string",
+                        self.tenant_field
+                    ),
                 ))
             })?
             .to_string();

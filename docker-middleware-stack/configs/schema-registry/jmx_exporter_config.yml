@@ -7,8 +7,8 @@
 
 startDelaySeconds: 0
 hostPort: schema-registry:1099
-username: "${JMX_USERNAME}"
-password: "${JMX_PASSWORD}"
+username: ""
+password: ""
 ssl: false
 lowercaseOutputName: true
 lowercaseOutputLabelNames: true
