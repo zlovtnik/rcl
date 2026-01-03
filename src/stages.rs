@@ -1,3 +1,4 @@
+use crate::config::validate_tenant_identifier;
 use crate::eip::{Stage, StageContext, StageError, StageResult};
 use crate::errors::{ProcessingError, ValidationError};
 use anyhow::Result;
@@ -7,6 +8,7 @@ use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
+use tracing::{debug, info};
 
 /// Filter Stage - Skip messages that don't match criteria
 #[derive(Debug)]
@@ -212,10 +214,31 @@ pub struct TransformerStage {
 
 #[derive(Clone, Debug)]
 enum Transformation {
-    Rename { from: String, to: String },
-    Convert { field: String, converter: Converter },
-    AddField { name: String, value: ValueGenerator },
-    RemoveField { name: String },
+    Rename {
+        from: String,
+        to: String,
+    },
+    Convert {
+        field: String,
+        converter: Converter,
+    },
+    AddField {
+        name: String,
+        value: ValueGenerator,
+    },
+    RemoveField {
+        name: String,
+    },
+    Flatten {
+        field: String,
+        prefix: Option<String>,
+    },
+    Script {
+        #[allow(dead_code)]
+        engine: ScriptEngine,
+        #[allow(dead_code)]
+        code: String,
+    },
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -224,6 +247,13 @@ enum Converter {
     ToDecimal,
     ToInteger,
     ToString,
+    UnixToIso8601,
+    Iso8601ToUnix,
+}
+
+#[derive(Clone, Debug)]
+enum ScriptEngine {
+    Rhai,
 }
 
 #[derive(Clone, Debug)]
@@ -285,6 +315,8 @@ impl TransformerStage {
                     "decimal" => Converter::ToDecimal,
                     "integer" => Converter::ToInteger,
                     "string" => Converter::ToString,
+                    "unix_to_iso8601" => Converter::UnixToIso8601,
+                    "iso8601_to_unix" => Converter::Iso8601ToUnix,
                     other => return Err(anyhow::anyhow!("unknown converter: {}", other)),
                 };
                 Ok(Transformation::Convert { field, converter })
@@ -311,6 +343,34 @@ impl TransformerStage {
                     .ok_or_else(|| anyhow::anyhow!("missing name in remove_field"))?
                     .to_string();
                 Ok(Transformation::RemoveField { name })
+            }
+            "flatten" => {
+                let field = config
+                    .get("field")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("missing field in flatten"))?
+                    .to_string();
+                let prefix = config
+                    .get("prefix")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                Ok(Transformation::Flatten { field, prefix })
+            }
+            "script" => {
+                let engine_str = config
+                    .get("engine")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("rhai");
+                let engine = match engine_str {
+                    "rhai" => ScriptEngine::Rhai,
+                    other => return Err(anyhow::anyhow!("unsupported script engine: {}", other)),
+                };
+                let code = config
+                    .get("code")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("missing code in script"))?
+                    .to_string();
+                Ok(Transformation::Script { engine, code })
             }
             other => Err(anyhow::anyhow!("unknown transformation type: {}", other)),
         }
@@ -347,6 +407,28 @@ impl Transformation {
                 remove_field(msg, name).map_err(|e| {
                     ProcessingError::Stage(StageError::new("field_error", e.to_string()))
                 })?;
+            }
+            Transformation::Flatten { field, prefix } => {
+                if let Some(Value::Object(obj)) = remove_field(msg, field).map_err(|e| {
+                    ProcessingError::Stage(StageError::new("field_error", e.to_string()))
+                })? {
+                    for (k, v) in obj {
+                        let new_key = if let Some(p) = prefix {
+                            format!("{}{}", p, k)
+                        } else {
+                            k
+                        };
+                        set_field(msg, &new_key, v).map_err(|e| {
+                            ProcessingError::Stage(StageError::new("field_error", e.to_string()))
+                        })?;
+                    }
+                }
+            }
+            Transformation::Script { .. } => {
+                return Err(ProcessingError::Stage(StageError::new(
+                    "not_implemented",
+                    "Scripting not supported yet",
+                )));
             }
         }
         Ok(())
@@ -429,6 +511,51 @@ impl Converter {
                 }
             }
             Converter::ToString => Ok(Value::String(value.to_string())),
+            Converter::UnixToIso8601 => {
+                let ts = match value {
+                    Value::Number(n) => n.as_i64().ok_or_else(|| {
+                        ProcessingError::Stage(StageError::new(
+                            "conversion_error",
+                            "Invalid unix timestamp",
+                        ))
+                    })?,
+                    Value::String(s) => s.parse::<i64>().map_err(|e| {
+                        ProcessingError::Stage(StageError::new(
+                            "conversion_error",
+                            format!("Parse unix timestamp error: {}", e),
+                        ))
+                    })?,
+                    _ => {
+                        return Err(ProcessingError::Stage(StageError::new(
+                            "conversion_error",
+                            "cannot convert to iso8601",
+                        )));
+                    }
+                };
+                let dt = chrono::DateTime::from_timestamp(ts, 0).ok_or_else(|| {
+                    ProcessingError::Stage(StageError::new(
+                        "conversion_error",
+                        "Invalid unix timestamp",
+                    ))
+                })?;
+                Ok(Value::String(dt.to_rfc3339()))
+            }
+            Converter::Iso8601ToUnix => {
+                if let Value::String(s) = value {
+                    let dt = chrono::DateTime::parse_from_rfc3339(&s).map_err(|e| {
+                        ProcessingError::Stage(StageError::new(
+                            "conversion_error",
+                            format!("Parse iso8601 error: {}", e),
+                        ))
+                    })?;
+                    Ok(Value::Number(serde_json::Number::from(dt.timestamp())))
+                } else {
+                    Err(ProcessingError::Stage(StageError::new(
+                        "conversion_error",
+                        "cannot convert to unix timestamp",
+                    )))
+                }
+            }
         }
     }
 }
@@ -460,9 +587,29 @@ impl Stage for TransformerStage {
         ctx: &StageContext,
         mut msg: Value,
     ) -> Result<StageResult, ProcessingError> {
-        for transform in &self.transformations {
-            transform.apply(&mut msg, ctx)?;
+        debug!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, transformations = self.transformations.len(), "starting transformer stage");
+
+        for (idx, transform) in self.transformations.iter().enumerate() {
+            match transform {
+                crate::stages::Transformation::Rename { from, to } => {
+                    debug!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, idx = idx, from = %from, to = %to, "renaming field");
+                    transform.apply(&mut msg, ctx)?;
+                    info!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, from = %from, to = %to, "field renamed");
+                }
+                crate::stages::Transformation::Convert { field, .. } => {
+                    debug!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, idx = idx, field = %field, "converting field");
+                    transform.apply(&mut msg, ctx)?;
+                    if let Some(converted_val) = msg.get(field) {
+                        info!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, field = %field, value = %converted_val, "field converted");
+                    }
+                }
+                _ => {
+                    transform.apply(&mut msg, ctx)?;
+                }
+            }
         }
+
+        info!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, "transformer stage completed");
         Ok(StageResult::Continue(msg))
     }
 
@@ -563,7 +710,136 @@ impl Stage for RouterStage {
     }
 }
 
-/// Splitter Stage - Split one message into many
+/// Tenant Router Stage - Routes messages to tenant-specific staging tables
+///
+/// Enables multi-tenant support by:
+/// 1. Extracting tenant_id from messages
+/// 2. Optionally appending tenant_id to table name (e.g., stg_orders -> stg_orders_acme)
+/// 3. Injecting tenant_id and table destination into message metadata
+#[derive(Debug)]
+pub struct TenantRouterStage {
+    #[allow(dead_code)]
+    name: String,
+    tenant_field: String,
+    staging_table: String,
+    table_suffix_enabled: bool,
+    table_suffix_prefix: String,
+    metadata_field: String,
+    tenant_metadata_field: String,
+}
+
+impl TenantRouterStage {
+    pub fn from_config(name: String, config: Value) -> Result<Self> {
+        let tenant_field = config
+            .get("tenant_field")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing tenant_field"))?
+            .to_string();
+
+        let staging_table = config
+            .get("staging_table")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing staging_table"))?
+            .to_string();
+
+        let table_suffix_enabled = config
+            .get("table_suffix_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let table_suffix_prefix = config
+            .get("table_suffix_prefix")
+            .and_then(|v| v.as_str())
+            .unwrap_or("_")
+            .to_string();
+
+        let metadata_field = config
+            .get("metadata_field")
+            .and_then(|v| v.as_str())
+            .unwrap_or("_destination_table")
+            .to_string();
+
+        let tenant_metadata_field = config
+            .get("tenant_metadata_field")
+            .and_then(|v| v.as_str())
+            .unwrap_or("_tenant_id")
+            .to_string();
+
+        Ok(Self {
+            name,
+            tenant_field,
+            staging_table,
+            table_suffix_enabled,
+            table_suffix_prefix,
+            metadata_field,
+            tenant_metadata_field,
+        })
+    }
+}
+
+#[async_trait]
+impl Stage for TenantRouterStage {
+    async fn process(
+        &self,
+        _ctx: &StageContext,
+        mut msg: Value,
+    ) -> Result<StageResult, ProcessingError> {
+        // Extract tenant ID from message
+        let tenant_id = get_field(&msg, &self.tenant_field)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ProcessingError::Stage(StageError::new(
+                    "tenant_routing_error",
+                    format!(
+                        "tenant field '{}' not found or not a string",
+                        self.tenant_field
+                    ),
+                ))
+            })?
+            .to_string();
+
+        // Validate tenant ID to prevent SQL injection
+        validate_tenant_identifier(&tenant_id).map_err(|e| {
+            ProcessingError::Stage(StageError::new(
+                "tenant_validation_error",
+                format!("invalid tenant_id '{}': {}", tenant_id, e),
+            ))
+        })?;
+
+        // Determine destination table
+        let destination_table = if self.table_suffix_enabled {
+            format!(
+                "{}{}{}",
+                self.staging_table, self.table_suffix_prefix, tenant_id
+            )
+        } else {
+            self.staging_table.clone()
+        };
+
+        // Inject destination table into metadata
+        set_field(
+            &mut msg,
+            &self.metadata_field,
+            Value::String(destination_table),
+        )
+        .map_err(|e| ProcessingError::Stage(StageError::new("field_error", e.to_string())))?;
+
+        // Inject tenant ID into metadata
+        set_field(
+            &mut msg,
+            &self.tenant_metadata_field,
+            Value::String(tenant_id),
+        )
+        .map_err(|e| ProcessingError::Stage(StageError::new("field_error", e.to_string())))?;
+
+        Ok(StageResult::Continue(msg))
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 #[derive(Debug)]
 pub struct SplitterStage {
     #[allow(dead_code)]
@@ -687,7 +963,7 @@ fn set_field(value: &mut Value, field: &str, new_value: Value) -> Result<()> {
     for (i, part) in parts.iter().enumerate() {
         if i == parts.len() - 1 {
             // Last part, set the value
-            if let Value::Object(ref mut map) = current {
+            if let Value::Object(map) = current {
                 map.insert((*part).to_string(), new_value_opt.take().unwrap());
             } else {
                 return Err(anyhow::anyhow!("cannot set field on non-object"));
@@ -699,8 +975,9 @@ fn set_field(value: &mut Value, field: &str, new_value: Value) -> Result<()> {
                     "invalid path: cannot traverse through non-object at intermediate segment"
                 ));
             }
-            if let Value::Object(ref mut map) = current {
+            if let Value::Object(map) = current {
                 // Check if the key exists and is not an object
+                #[allow(clippy::collapsible_if)]
                 if let Some(existing) = map.get(*part) {
                     if !existing.is_object() {
                         return Err(anyhow::anyhow!(
@@ -730,14 +1007,14 @@ fn remove_field(value: &mut Value, field: &str) -> Result<Option<Value>> {
     for (i, part) in parts.iter().enumerate() {
         if i == parts.len() - 1 {
             // Last part, remove the value
-            if let Value::Object(ref mut map) = current {
+            if let Value::Object(map) = current {
                 return Ok(map.remove(*part));
             } else {
                 return Ok(None);
             }
         } else {
             // Intermediate part
-            if let Value::Object(ref mut map) = current {
+            if let Value::Object(map) = current {
                 if let Some(next) = map.get_mut(*part) {
                     current = next;
                 } else {
@@ -752,7 +1029,7 @@ fn remove_field(value: &mut Value, field: &str) -> Result<Option<Value>> {
 }
 
 fn merge_objects(mut base: Value, other: Value) -> Value {
-    if let (Value::Object(ref mut base_map), Value::Object(other_map)) = (&mut base, other) {
+    if let (Value::Object(base_map), Value::Object(other_map)) = (&mut base, other) {
         for (k, v) in other_map {
             base_map.insert(k, v);
         }
@@ -799,7 +1076,7 @@ impl DeduplicationStorage for RedisStorage {
     /// # }
     /// ```
     ///
-    — `true` if the key was set (did not previously exist), `false` otherwise.
+    /// Returns `true` if the key was set (did not previously exist), `false` otherwise.
     async fn check_and_set(&self, key: &str, ttl: Duration) -> Result<bool> {
         let conn = self
             .connection
@@ -893,7 +1170,7 @@ impl IdempotentReceiverStage {
                 return Err(anyhow::anyhow!(
                     "unsupported storage type: {}",
                     storage_type
-                ))
+                ));
             }
         };
 
@@ -1344,10 +1621,12 @@ mod tests {
         });
         let result = FilterStage::from_config("test".to_string(), config);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("invalid filter mode"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid filter mode")
+        );
     }
 
     #[test]
@@ -1375,10 +1654,12 @@ mod tests {
         });
         let result = FilterStage::from_config("test".to_string(), config);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("missing conditions"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("missing conditions")
+        );
     }
 
     #[test]
@@ -1410,10 +1691,12 @@ mod tests {
         });
         let result = FilterStage::from_config("test".to_string(), config);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("no valid operator"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no valid operator")
+        );
     }
 
     #[test]

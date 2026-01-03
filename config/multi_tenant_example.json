@@ -1,0 +1,217 @@
+{
+  "service": {
+    "log_level": "info",
+    "metrics_port": 9090,
+    "health_check_timeout_ms": 5000,
+    "shutdown_timeout": "30s"
+  },
+  "kafka": {
+    "brokers": [
+      "localhost:9092"
+    ],
+    "group_id": "rcl-multi-tenant",
+    "session_timeout_ms": 45000,
+    "max_inflight_messages": 500,
+    "dlq_message_timeout_ms": 15000
+  },
+  "postgres": {
+    "url": "postgresql://postgres:postgres@localhost:5432/rcl",
+    "pool": {
+      "max_connections": 50,
+      "acquire_timeout_ms": 5000
+    }
+  },
+  "pipelines": [
+    {
+      "name": "orders_multi_tenant",
+      "topic": "cdc.orders",
+      "debezium_envelope": true,
+      "staging_table": "stg_orders",
+      "required_fields": [
+        "order_id",
+        "customer_id"
+      ],
+      "backpressure": {
+        "channel_capacity": 20000
+      },
+      "batching": {
+        "flush_interval_ms": 5000,
+        "max_batch_size": 5000,
+        "max_batch_bytes": 10485760,
+        "adaptive_enabled": false
+      },
+      "circuit_breaker": {
+        "enabled": true,
+        "failure_threshold": 10,
+        "success_threshold": 5,
+        "half_open_timeout_ms": 30000
+      },
+      "worker_threads": 2,
+      "stages": [
+        {
+          "type": "filter",
+          "name": "valid_orders",
+          "config": {
+            "field": "order_status",
+            "operator": "equals",
+            "value": "confirmed",
+            "mode": "include"
+          }
+        },
+        {
+          "type": "tenant_router",
+          "name": "route_by_customer",
+          "config": {
+            "tenant_field": "customer_id",
+            "staging_table": "stg_orders",
+            "table_suffix_enabled": false,
+            "table_suffix_prefix": "_",
+            "metadata_field": "_destination_table",
+            "tenant_metadata_field": "_tenant_id"
+          }
+        },
+        {
+          "type": "transformer",
+          "name": "normalize_fields",
+          "config": {
+            "operations": [
+              {
+                "type": "rename",
+                "from": "original_order_id",
+                "to": "order_id"
+              },
+              {
+                "type": "copy",
+                "from": "customer_name",
+                "to": "customer_display_name"
+              }
+            ]
+          }
+        }
+      ],
+      "multi_tenancy": {
+        "tenant_field": "customer_id",
+        "table_suffix_enabled": false,
+        "table_suffix_prefix": "_",
+        "max_messages_per_sec": 5000,
+        "max_bytes_per_sec": 50000000,
+        "tenant_limits": {
+          "acme-corp": {
+            "max_messages_per_sec": 50000,
+            "max_bytes_per_sec": 500000000
+          },
+          "widgets-inc": {
+            "max_messages_per_sec": 1000,
+            "max_bytes_per_sec": 10000000
+          },
+          "startup-xyz": {
+            "max_messages_per_sec": 500,
+            "max_bytes_per_sec": 5000000
+          }
+        }
+      },
+      "dlq": {
+        "topic": "dlq.orders",
+        "max_retries": 3,
+        "max_payload_bytes": 1048576
+      }
+    },
+    {
+      "name": "payments_multi_tenant",
+      "topic": "cdc.payments",
+      "debezium_envelope": true,
+      "staging_table": "stg_payments",
+      "required_fields": [
+        "payment_id",
+        "merchant_id"
+      ],
+      "backpressure": {
+        "channel_capacity": 15000
+      },
+      "batching": {
+        "flush_interval_ms": 3000,
+        "max_batch_bytes": 5242880,
+        "adaptive_enabled": true,
+        "min_batch_size": 100,
+        "max_batch_size": 10000,
+        "latency_window_size": 10,
+        "latency_target_ms": 1000
+      },
+      "circuit_breaker": {
+        "enabled": true,
+        "failure_threshold": 5,
+        "success_threshold": 3,
+        "half_open_timeout_ms": 20000
+      },
+      "worker_threads": 4,
+      "stages": [
+        {
+          "type": "filter",
+          "name": "completed_payments",
+          "config": {
+            "field": "status",
+            "operator": "in",
+            "value": [
+              "completed",
+              "settled"
+            ],
+            "mode": "include"
+          }
+        },
+        {
+          "type": "tenant_router",
+          "name": "route_by_merchant",
+          "config": {
+            "tenant_field": "merchant_id",
+            "staging_table": "stg_payments",
+            "table_suffix_enabled": true,
+            "table_suffix_prefix": "_merchant_",
+            "metadata_field": "_destination_table",
+            "tenant_metadata_field": "_tenant_id"
+          }
+        },
+        {
+          "type": "transformer",
+          "name": "enrich_payment",
+          "config": {
+            "operations": [
+              {
+                "type": "extract",
+                "field": "amount",
+                "target": "amount_cents",
+                "subfield": "value"
+              },
+              {
+                "type": "convert",
+                "field": "timestamp",
+                "to_type": "number"
+              }
+            ]
+          }
+        }
+      ],
+      "multi_tenancy": {
+        "tenant_field": "merchant_id",
+        "table_suffix_enabled": true,
+        "table_suffix_prefix": "_merchant_",
+        "max_messages_per_sec": 10000,
+        "max_bytes_per_sec": 100000000,
+        "tenant_limits": {
+          "stripe": {
+            "max_messages_per_sec": 100000,
+            "max_bytes_per_sec": 1000000000
+          },
+          "square": {
+            "max_messages_per_sec": 50000,
+            "max_bytes_per_sec": 500000000
+          }
+        }
+      },
+      "dlq": {
+        "topic": "dlq.payments",
+        "max_retries": 5,
+        "max_payload_bytes": 2097152
+      }
+    }
+  ]
+}

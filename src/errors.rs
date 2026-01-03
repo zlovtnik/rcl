@@ -161,14 +161,11 @@ pub struct ValidationError {
 }
 
 impl ValidationError {
-    /// Creates a new DebeziumError with the provided message.
+    /// Creates a new ValidationError with the provided message.
     ///
     /// # Examples
     ///
-    /// ```
-    /// let err = DebeziumError::new("invalid debezium envelope");
-    /// assert_eq!(err.message, "invalid debezium envelope");
-    /// ```
+    ///
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -199,6 +196,7 @@ impl BatchPartialFailure {
     /// assert_eq!(bpf.total_count, 3);
     /// assert_eq!(bpf.failed_count, 1);
     /// ```
+    #[allow(dead_code)]
     pub fn new(
         total_count: usize,
         failed_messages: Vec<(serde_json::Value, MessageError)>,

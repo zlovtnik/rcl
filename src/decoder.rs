@@ -2,16 +2,20 @@ use crate::eip::PipelineConfig;
 use crate::errors::{DebeziumError, ProcessingError, ValidationError};
 use crate::types::Operation;
 use serde_json::Value;
+use tracing::debug;
 
 pub fn decode_and_validate(
     payload: &[u8],
     pipeline: &PipelineConfig,
 ) -> Result<Value, ProcessingError> {
     let raw = std::str::from_utf8(payload)?;
+    debug!(payload_size = payload.len(), pipeline = %pipeline.name, "decoding message");
     let mut value: Value = serde_json::from_str(raw)?;
 
     if pipeline.debezium_envelope {
+        debug!(pipeline = %pipeline.name, "unwrapping Debezium envelope");
         value = unwrap_debezium(value)?;
+        debug!(pipeline = %pipeline.name, operation = %value["operation_type"], "decoded Debezium message");
     }
 
     validate_required_fields(&value, pipeline)?;
@@ -64,8 +68,7 @@ fn unwrap_debezium(value: Value) -> Result<Value, ProcessingError> {
 ///
 /// # Errors
 ///
-/// Returns `ValidationError` with message `missing required field `<path>``
-—where `<path>` is the required dotted path—if any required field is absent or `null`.
+/// Returns `ValidationError` with message ``missing required field `<path>` `` where `<path>` is the required dotted path if any required field is absent or `null`.
 ///
 /// # Examples
 ///
@@ -97,7 +100,7 @@ fn validate_required_fields(
                     return Err(ValidationError::new(format!(
                         "missing required field `{}`",
                         field
-                    )))
+                    )));
                 }
             };
         }
@@ -134,6 +137,9 @@ mod tests {
                 channel_capacity: 100,
             },
             batching: Default::default(),
+            circuit_breaker: Default::default(),
+            worker_threads: 1,
+            multi_tenancy: None,
         }
     }
 

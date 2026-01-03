@@ -1,15 +1,26 @@
 use crate::health::{ComponentStatus, HealthRegistry};
 use anyhow::Result;
-use axum::{routing::get, Router};
+use axum::{Router, routing::get};
 use prometheus::{
-    Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
-    Registry, TextEncoder,
+    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tracing::error;
+
+/// Circuit breaker state encodings for metrics reporting.
+#[allow(dead_code)]
+mod circuit_breaker_states {
+    /// Circuit breaker is Closed (normal operation, requests allowed).
+    pub const STATE_CLOSED: i64 = 0;
+    /// Circuit breaker is Open (fast-fail, requests rejected without attempting downstream).
+    pub const STATE_OPEN: i64 = 1;
+    /// Circuit breaker is Half-Open (testing recovery with limited trial requests).
+    pub const STATE_HALF_OPEN: i64 = 2;
+}
 
 #[derive(Clone)]
 pub struct Metrics {
@@ -27,6 +38,52 @@ pub struct Metrics {
     pub batch_bytes_total: IntCounter,
     pub batch_latency_seconds: Histogram,
     pub current_batch_size_limit: IntGauge,
+    // Circuit breaker metrics
+    pub circuit_breaker_state: IntGaugeVec,
+    #[allow(dead_code)]
+    pub circuit_breaker_opens_total: IntCounterVec,
+    #[allow(dead_code)]
+    pub circuit_breaker_closed_total: IntCounterVec,
+    // Retry metrics
+    pub retry_attempts: Histogram,
+    pub retry_success_after_n_attempts: IntCounterVec,
+    // Phase 5.1: Enhanced per-pipeline metrics
+    #[allow(dead_code)]
+    pub batch_size_per_pipeline: HistogramVec,
+    #[allow(dead_code)]
+    pub batch_flush_reason_per_pipeline: IntCounterVec,
+    pub channel_depth_per_pipeline: IntGaugeVec,
+    #[allow(dead_code)]
+    pub write_throughput_bytes_per_pipeline: IntCounterVec,
+    #[allow(dead_code)]
+    pub copy_vs_insert_ratio_per_pipeline: IntCounterVec,
+    #[allow(dead_code)]
+    pub retry_attempts_per_pipeline: HistogramVec,
+    #[allow(dead_code)]
+    pub circuit_breaker_state_per_pipeline: IntGaugeVec,
+    #[allow(dead_code)]
+    pub inflight_batches_per_pipeline: IntGaugeVec,
+    // Throughput metrics
+    pub write_throughput_records_per_second_per_pipeline: IntGaugeVec,
+    #[allow(dead_code)]
+    pub memory_usage_bytes: IntGauge,
+    #[allow(dead_code)]
+    pub memory_usage_per_pipeline: IntGaugeVec,
+    // Multi-tenancy metrics (Phase 9.2)
+    #[allow(dead_code)]
+    pub tenant_messages_total: IntCounterVec,
+    #[allow(dead_code)]
+    pub tenant_bytes_total: IntCounterVec,
+    #[allow(dead_code)]
+    pub tenant_processing_failures: IntCounterVec,
+    #[allow(dead_code)]
+    pub tenant_dlq_total: IntCounterVec,
+    #[allow(dead_code)]
+    pub tenant_write_latency_seconds: HistogramVec,
+    #[allow(dead_code)]
+    pub tenant_rate_limit_rejections: IntCounterVec,
+    #[allow(dead_code)]
+    pub tenant_rate_limit_tokens_available: IntGaugeVec,
 }
 
 impl Metrics {
@@ -134,6 +191,200 @@ impl Metrics {
         registry.register(Box::new(batch_latency_seconds.clone()))?;
         registry.register(Box::new(current_batch_size_limit.clone()))?;
 
+        // Circuit breaker metrics
+        let circuit_breaker_state = IntGaugeVec::new(
+            Opts::new(
+                "circuit_breaker_state",
+                "Circuit breaker state (0=Closed, 1=Open, 2=HalfOpen)",
+            ),
+            &["pipeline"],
+        )?;
+        let circuit_breaker_opens_total = IntCounterVec::new(
+            Opts::new("circuit_breaker_opens_total", "Total circuit breaker opens"),
+            &["pipeline"],
+        )?;
+        let circuit_breaker_closed_total = IntCounterVec::new(
+            Opts::new(
+                "circuit_breaker_closed_total",
+                "Total circuit breaker close events (transitions from Open to Closed)",
+            ),
+            &["pipeline"],
+        )?;
+
+        registry.register(Box::new(circuit_breaker_state.clone()))?;
+        registry.register(Box::new(circuit_breaker_opens_total.clone()))?;
+        registry.register(Box::new(circuit_breaker_closed_total.clone()))?;
+
+        // Retry metrics
+        let retry_attempts = Histogram::with_opts(
+            HistogramOpts::new(
+                "retry_attempts",
+                "Number of attempts per write (including retries)",
+            )
+            .buckets(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]),
+        )?;
+        let retry_success_after_n_attempts = IntCounterVec::new(
+            Opts::new(
+                "retry_success_after_n_attempts",
+                "Successful writes after N retry attempts",
+            ),
+            &["attempts"],
+        )?;
+
+        registry.register(Box::new(retry_attempts.clone()))?;
+        registry.register(Box::new(retry_success_after_n_attempts.clone()))?;
+
+        // Phase 5.1: Enhanced per-pipeline metrics
+        let batch_size_per_pipeline = HistogramVec::new(
+            HistogramOpts::new(
+                "batch_size_per_pipeline",
+                "Number of records per batch per pipeline",
+            )
+            .buckets(vec![
+                1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0,
+            ]),
+            &["pipeline"],
+        )?;
+        let batch_flush_reason_per_pipeline = IntCounterVec::new(
+            Opts::new(
+                "batch_flush_reason_per_pipeline",
+                "Batch flush count per pipeline per reason (time/size/bytes/shutdown)",
+            ),
+            &["pipeline", "reason"],
+        )?;
+        let channel_depth_per_pipeline = IntGaugeVec::new(
+            Opts::new(
+                "channel_depth_per_pipeline",
+                "Number of messages pending in pipeline channel",
+            ),
+            &["pipeline"],
+        )?;
+        let write_throughput_bytes_per_pipeline = IntCounterVec::new(
+            Opts::new(
+                "write_throughput_bytes_per_pipeline",
+                "Total bytes written to database per pipeline",
+            ),
+            &["pipeline"],
+        )?;
+        let copy_vs_insert_ratio_per_pipeline = IntCounterVec::new(
+            Opts::new(
+                "copy_vs_insert_ratio_per_pipeline",
+                "Count of COPY vs INSERT operations per pipeline per method",
+            ),
+            &["pipeline", "method"],
+        )?;
+        let retry_attempts_per_pipeline = HistogramVec::new(
+            HistogramOpts::new(
+                "retry_attempts_per_pipeline",
+                "Number of retry attempts per write per pipeline",
+            )
+            .buckets(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]),
+            &["pipeline"],
+        )?;
+        let circuit_breaker_state_per_pipeline = IntGaugeVec::new(
+            Opts::new(
+                "circuit_breaker_state_per_pipeline",
+                "Circuit breaker state per pipeline (0=Closed, 1=Open, 2=HalfOpen)",
+            ),
+            &["pipeline"],
+        )?;
+        let inflight_batches_per_pipeline = IntGaugeVec::new(
+            Opts::new(
+                "inflight_batches_per_pipeline",
+                "Number of batches currently being written per pipeline",
+            ),
+            &["pipeline"],
+        )?;
+
+        let write_throughput_records_per_second_per_pipeline = IntGaugeVec::new(
+            Opts::new(
+                "write_throughput_records_per_second_per_pipeline",
+                "Current write throughput in records per second per pipeline",
+            ),
+            &["pipeline"],
+        )?;
+
+        registry.register(Box::new(batch_size_per_pipeline.clone()))?;
+        registry.register(Box::new(batch_flush_reason_per_pipeline.clone()))?;
+        registry.register(Box::new(channel_depth_per_pipeline.clone()))?;
+        registry.register(Box::new(write_throughput_bytes_per_pipeline.clone()))?;
+        registry.register(Box::new(copy_vs_insert_ratio_per_pipeline.clone()))?;
+        registry.register(Box::new(retry_attempts_per_pipeline.clone()))?;
+        registry.register(Box::new(circuit_breaker_state_per_pipeline.clone()))?;
+        registry.register(Box::new(inflight_batches_per_pipeline.clone()))?;
+        registry.register(Box::new(
+            write_throughput_records_per_second_per_pipeline.clone(),
+        ))?;
+
+        // Memory management metrics
+        let memory_usage_bytes = IntGauge::new(
+            "memory_usage_bytes",
+            "Current process memory usage in bytes",
+        )?;
+        let memory_usage_per_pipeline = IntGaugeVec::new(
+            Opts::new(
+                "memory_usage_per_pipeline",
+                "Estimated memory usage per pipeline in bytes",
+            ),
+            &["pipeline"],
+        )?;
+
+        registry.register(Box::new(memory_usage_bytes.clone()))?;
+        registry.register(Box::new(memory_usage_per_pipeline.clone()))?;
+
+        // Multi-tenancy metrics (Phase 9.2)
+        let tenant_messages_total = IntCounterVec::new(
+            Opts::new("tenant_messages_total", "Messages processed per tenant"),
+            &["tenant_id"],
+        )?;
+        let tenant_bytes_total = IntCounterVec::new(
+            Opts::new("tenant_bytes_total", "Bytes processed per tenant"),
+            &["tenant_id"],
+        )?;
+        let tenant_processing_failures = IntCounterVec::new(
+            Opts::new(
+                "tenant_processing_failures",
+                "Processing failures per tenant",
+            ),
+            &["tenant_id"],
+        )?;
+        let tenant_dlq_total = IntCounterVec::new(
+            Opts::new("tenant_dlq_total", "Messages sent to DLQ per tenant"),
+            &["tenant_id"],
+        )?;
+        let tenant_write_latency_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "tenant_write_latency_seconds",
+                "Write latency per tenant in seconds",
+            )
+            .buckets(vec![
+                0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0,
+            ]),
+            &["tenant_id"],
+        )?;
+        let tenant_rate_limit_rejections = IntCounterVec::new(
+            Opts::new(
+                "tenant_rate_limit_rejections",
+                "Rate limit rejections per tenant",
+            ),
+            &["tenant_id"],
+        )?;
+        let tenant_rate_limit_tokens_available = IntGaugeVec::new(
+            Opts::new(
+                "tenant_rate_limit_tokens_available",
+                "Available rate limit tokens per tenant",
+            ),
+            &["tenant_id"],
+        )?;
+
+        registry.register(Box::new(tenant_messages_total.clone()))?;
+        registry.register(Box::new(tenant_bytes_total.clone()))?;
+        registry.register(Box::new(tenant_processing_failures.clone()))?;
+        registry.register(Box::new(tenant_dlq_total.clone()))?;
+        registry.register(Box::new(tenant_write_latency_seconds.clone()))?;
+        registry.register(Box::new(tenant_rate_limit_rejections.clone()))?;
+        registry.register(Box::new(tenant_rate_limit_tokens_available.clone()))?;
+
         Ok(Self {
             messages_total,
             decode_failures,
@@ -148,6 +399,29 @@ impl Metrics {
             batch_bytes_total,
             batch_latency_seconds,
             current_batch_size_limit,
+            circuit_breaker_state,
+            circuit_breaker_opens_total,
+            circuit_breaker_closed_total,
+            retry_attempts,
+            retry_success_after_n_attempts,
+            batch_size_per_pipeline,
+            batch_flush_reason_per_pipeline,
+            channel_depth_per_pipeline,
+            write_throughput_bytes_per_pipeline,
+            copy_vs_insert_ratio_per_pipeline,
+            retry_attempts_per_pipeline,
+            circuit_breaker_state_per_pipeline,
+            inflight_batches_per_pipeline,
+            write_throughput_records_per_second_per_pipeline,
+            memory_usage_bytes,
+            memory_usage_per_pipeline,
+            tenant_messages_total,
+            tenant_bytes_total,
+            tenant_processing_failures,
+            tenant_dlq_total,
+            tenant_write_latency_seconds,
+            tenant_rate_limit_rejections,
+            tenant_rate_limit_tokens_available,
         })
     }
 }
@@ -761,5 +1035,205 @@ mod tests {
             }
         }
         panic!("write_latency_seconds histogram metric not found");
+    }
+
+    #[test]
+    fn test_circuit_breaker_state_gauge() {
+        let registry = Registry::new();
+        let metrics = Metrics::register(&registry).expect("should register metrics");
+
+        // Test setting circuit breaker states for different pipelines
+        metrics
+            .circuit_breaker_state
+            .with_label_values(&["pipeline1"])
+            .set(circuit_breaker_states::STATE_CLOSED);
+        metrics
+            .circuit_breaker_state
+            .with_label_values(&["pipeline2"])
+            .set(circuit_breaker_states::STATE_OPEN);
+        metrics
+            .circuit_breaker_state
+            .with_label_values(&["pipeline3"])
+            .set(circuit_breaker_states::STATE_HALF_OPEN);
+
+        // Verify we can read the gauge values by recreating the labels
+        // The IntGaugeVec stores state values internally; we verify by examining the gathered metrics
+        let metric_families = registry.gather();
+        let mut found_count = 0;
+        for mf in &metric_families {
+            if mf.get_name() == "circuit_breaker_state" {
+                found_count = mf.get_metric().len();
+            }
+        }
+        // Should have at least 3 label combinations
+        assert!(found_count >= 3, "expected at least 3 state gauge metrics");
+    }
+
+    #[test]
+    fn test_circuit_breaker_opens_counter() {
+        let registry = Registry::new();
+        let metrics = Metrics::register(&registry).expect("should register metrics");
+
+        // Increment circuit breaker open events for different pipelines
+        metrics
+            .circuit_breaker_opens_total
+            .with_label_values(&["pipeline1"])
+            .inc();
+        metrics
+            .circuit_breaker_opens_total
+            .with_label_values(&["pipeline1"])
+            .inc();
+        metrics
+            .circuit_breaker_opens_total
+            .with_label_values(&["pipeline2"])
+            .inc();
+
+        // Verify the metrics are registered and callable
+        assert_eq!(
+            metrics
+                .circuit_breaker_opens_total
+                .with_label_values(&["pipeline1"])
+                .get(),
+            2
+        );
+        assert_eq!(
+            metrics
+                .circuit_breaker_opens_total
+                .with_label_values(&["pipeline2"])
+                .get(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_circuit_breaker_closed_counter() {
+        let registry = Registry::new();
+        let metrics = Metrics::register(&registry).expect("should register metrics");
+
+        // Increment circuit breaker closed events (transitions from Open to Closed)
+        metrics
+            .circuit_breaker_closed_total
+            .with_label_values(&["pipeline1"])
+            .inc();
+        metrics
+            .circuit_breaker_closed_total
+            .with_label_values(&["pipeline1"])
+            .inc();
+        metrics
+            .circuit_breaker_closed_total
+            .with_label_values(&["pipeline1"])
+            .inc();
+        metrics
+            .circuit_breaker_closed_total
+            .with_label_values(&["pipeline2"])
+            .inc_by(2);
+
+        // Verify counter values using direct metric access
+        assert_eq!(
+            metrics
+                .circuit_breaker_closed_total
+                .with_label_values(&["pipeline1"])
+                .get(),
+            3
+        );
+        assert_eq!(
+            metrics
+                .circuit_breaker_closed_total
+                .with_label_values(&["pipeline2"])
+                .get(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_retry_attempts_histogram() {
+        let registry = Registry::new();
+        let metrics = Metrics::register(&registry).expect("should register metrics");
+
+        // Record retry attempts across different scenarios
+        let attempt_counts = vec![1.0, 2.0, 3.0, 1.0, 4.0, 2.0];
+        let expected_sum: f64 = attempt_counts.iter().sum();
+        for attempts in attempt_counts {
+            metrics.retry_attempts.observe(attempts);
+        }
+
+        // Verify histogram observations via registry
+        let metric_families = registry.gather();
+        for mf in &metric_families {
+            if mf.get_name() == "retry_attempts" {
+                for metric in mf.get_metric() {
+                    if metric.has_histogram() {
+                        let histogram = metric.get_histogram();
+                        assert_eq!(
+                            histogram.get_sample_count(),
+                            6u64,
+                            "expected 6 attempt observations"
+                        );
+                        assert!(
+                            (histogram.get_sample_sum() - expected_sum).abs() < 0.0001,
+                            "expected sum {}, got {}",
+                            expected_sum,
+                            histogram.get_sample_sum()
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+        panic!("retry_attempts histogram not found");
+    }
+
+    #[test]
+    fn test_retry_success_after_n_attempts_counter() {
+        let registry = Registry::new();
+        let metrics = Metrics::register(&registry).expect("should register metrics");
+
+        // Record successful retries after various attempt counts
+        metrics
+            .retry_success_after_n_attempts
+            .with_label_values(&["1"])
+            .inc_by(10); // 10 successful writes on first attempt
+        metrics
+            .retry_success_after_n_attempts
+            .with_label_values(&["2"])
+            .inc_by(5); // 5 successful writes after 1 retry
+        metrics
+            .retry_success_after_n_attempts
+            .with_label_values(&["3"])
+            .inc_by(2); // 2 successful writes after 2 retries
+        metrics
+            .retry_success_after_n_attempts
+            .with_label_values(&["5"])
+            .inc(); // 1 successful write after 4 retries
+
+        // Verify counter values directly
+        assert_eq!(
+            metrics
+                .retry_success_after_n_attempts
+                .with_label_values(&["1"])
+                .get(),
+            10
+        );
+        assert_eq!(
+            metrics
+                .retry_success_after_n_attempts
+                .with_label_values(&["2"])
+                .get(),
+            5
+        );
+        assert_eq!(
+            metrics
+                .retry_success_after_n_attempts
+                .with_label_values(&["3"])
+                .get(),
+            2
+        );
+        assert_eq!(
+            metrics
+                .retry_success_after_n_attempts
+                .with_label_values(&["5"])
+                .get(),
+            1
+        );
     }
 }

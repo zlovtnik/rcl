@@ -1,10 +1,11 @@
-use crate::config::{validate_table_identifier, PostgresConfig};
+use crate::config::{PostgresConfig, validate_table_identifier};
 use crate::errors::{ProcessingError, TransportError, ValidationError};
 use crate::health::{ComponentStatus, HealthRegistry};
 use crate::metrics::Metrics;
+use crate::offset_tracker::OffsetTracker;
+use crate::retry::RetryConfig;
 use crate::types::Operation;
 use backoff::future::retry;
-use backoff::ExponentialBackoff;
 use chrono::Utc;
 use csv::Writer as CsvWriter;
 
@@ -12,11 +13,14 @@ use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions, PgSslMode};
 use sqlx::types::Json;
-use sqlx::{PgPool, QueryBuilder};
+use sqlx::{Error as SqlxError, PgPool, QueryBuilder};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU32, Ordering},
+};
 use std::time::Duration;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 #[derive(Clone, Debug)]
 pub struct RecordMeta {
@@ -77,12 +81,13 @@ impl RecordMeta {
 pub struct Writer {
     pool: PgPool,
     cfg: Arc<PostgresConfig>,
+    retry_cfg: RetryConfig,
     metrics: Metrics,
     health: Arc<HealthRegistry>,
 }
 
-#[async_trait]
 #[allow(dead_code)]
+#[async_trait]
 pub trait WriterTrait: Send + Sync {
     async fn write(
         &self,
@@ -178,7 +183,8 @@ impl Writer {
     /// let cfg = Arc::new(/* construct PostgresConfig */);
     /// let metrics = /* construct Metrics */;
     /// let health = Arc::new(/* construct HealthRegistry */);
-    /// let writer = crate::writer::Writer::new(cfg, metrics, health).await?;
+    /// let retry_cfg = RetryConfig::default();
+    /// let writer = crate::writer::Writer::new(cfg, metrics, health, retry_cfg).await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -186,15 +192,16 @@ impl Writer {
         cfg: Arc<PostgresConfig>,
         metrics: Metrics,
         health: Arc<HealthRegistry>,
+        retry_cfg: RetryConfig,
     ) -> Result<Self, ProcessingError> {
         let mut url = cfg.url.clone();
-        if let Some(root_cert) = &cfg.ssl_root_cert {
-            if !url.contains("sslrootcert=") {
-                let separator = if url.contains('?') { "&" } else { "?" };
-                // Encode spaces in the cert path for URL safety
-                let encoded_cert = root_cert.replace(' ', "%20");
-                url.push_str(&format!("{}sslrootcert={}", separator, encoded_cert));
-            }
+        if let Some(root_cert) = &cfg.ssl_root_cert
+            && !url.contains("sslrootcert=")
+        {
+            let separator = if url.contains('?') { "&" } else { "?" };
+            // Encode spaces in the cert path for URL safety
+            let encoded_cert = root_cert.replace(' ', "%20");
+            url.push_str(&format!("{}sslrootcert={}", separator, encoded_cert));
         }
 
         let mut options = PgConnectOptions::from_str(&url).map_err(|e| {
@@ -212,7 +219,10 @@ impl Writer {
             ];
             let lower_mode = mode.to_lowercase();
             if !valid_modes.contains(&lower_mode.as_str()) {
-                warn!("invalid ssl_mode '{}', expected one of: disable, allow, prefer, require, verify-ca, verify-full; defaulting to 'prefer'", mode);
+                warn!(
+                    "invalid ssl_mode '{}', expected one of: disable, allow, prefer, require, verify-ca, verify-full; defaulting to 'prefer'",
+                    mode
+                );
             }
             let ssl_mode = match lower_mode.as_str() {
                 "disable" => PgSslMode::Disable,
@@ -236,6 +246,8 @@ impl Writer {
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
             .acquire_timeout(acquire_timeout)
+            .idle_timeout(Duration::from_secs(30)) // Close idle connections after 30s
+            .max_lifetime(Duration::from_secs(300)) // Force connection cycling every 5 minutes
             .connect_with(options)
             .await
             .map_err(|e| {
@@ -245,12 +257,26 @@ impl Writer {
 
         let _ = health.set_postgres_status(ComponentStatus::Healthy);
 
+        // Initialize offset tracker table
+        let offset_tracker = OffsetTracker::new(pool.clone());
+        offset_tracker.init().await.map_err(|e| {
+            ProcessingError::from(ValidationError::new(format!(
+                "offset tracker init failed: {}",
+                e
+            )))
+        })?;
+
         Ok(Self {
             pool,
             cfg,
+            retry_cfg,
             metrics,
             health,
         })
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     pub async fn write(
@@ -273,47 +299,180 @@ impl Writer {
         self.metrics.batch_size.observe(values.len() as f64);
         let timer = self.metrics.write_latency_seconds.start_timer();
 
+        info!(batch_size = values.len(), table = %table, pipeline = %pipeline_name, "writing batch to database");
+
         // Log operations for debugging
+        let mut operations_summary = std::collections::HashMap::new();
         for val in values {
             let meta = RecordMeta::extract(val);
-            tracing::trace!(operation = %meta.operation, "processing operation");
+            *operations_summary
+                .entry(meta.operation.to_string())
+                .or_insert(0) += 1;
+            // Only emit per-record debug logs if debug level is enabled to avoid high-throughput overhead
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!(operation = %meta.operation, topic = %meta.topic, partition = %meta.partition, offset = %meta.offset, "processing operation");
+            }
         }
 
-        let op = || async {
-            let res = if self.cfg.copy_enabled {
-                let mut conn = self
-                    .pool
-                    .acquire()
-                    .await
-                    .map_err(|e| ProcessingError::from(TransportError::new("pg acquire", e)))?;
+        info!(batch_size = values.len(), operations = ?operations_summary, "batch composition");
 
-                match copy_into(&mut conn, table, values).await {
-                    Ok(_) => Ok(()),
+        let attempt_count = Arc::new(AtomicU32::new(0));
+        let attempt_count_clone = attempt_count.clone();
+
+        let op = || async {
+            let attempts = attempt_count_clone.fetch_add(1, Ordering::SeqCst) + 1;
+            info!(attempt = attempts, batch_size = values.len(), table = %table, "write attempt");
+
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| {
+                    warn!(error = %e, attempt = attempts, "failed to begin transaction");
+                    ProcessingError::from(TransportError::new("pg begin", e))
+                })
+                .map_err(backoff::Error::transient)?;
+
+            let res = if self.cfg.copy_enabled {
+                debug!(table = %table, "attempting COPY bulk insert");
+                match copy_into(&mut tx, table, values).await {
+                    Ok(_) => {
+                        info!(batch_size = values.len(), table = %table, "COPY insert succeeded");
+                        Ok(())
+                    }
                     Err(err) => {
-                        warn!(table = %table, error = %err, "copy failed, falling back to insert");
-                        insert_batch(&self.pool, table, values).await
+                        // Check if this is an aborted transaction error
+                        let err_msg = err.to_string();
+                        if err_msg.contains("current transaction is aborted") {
+                            warn!(table = %table, error = %err, "transaction aborted during COPY, will retry with fresh transaction");
+                            // Return a special error that indicates we should retry with a fresh connection
+                            return Err(backoff::Error::transient(ProcessingError::from(
+                                TransportError::new("transaction aborted", SqlxError::Protocol("transaction aborted".to_string()))
+                            )));
+                        }
+                        warn!(table = %table, error = %err, "COPY failed, falling back to INSERT");
+                        match insert_batch(&mut tx, table, values).await {
+                            Ok(_) => Ok(()),
+                            Err(insert_err) => {
+                                // Check if INSERT also failed due to aborted transaction
+                                let insert_err_msg = insert_err.to_string();
+                                if insert_err_msg.contains("current transaction is aborted") {
+                                    warn!(table = %table, error = %insert_err, "transaction aborted during INSERT, will retry with fresh transaction");
+                                    return Err(backoff::Error::transient(ProcessingError::from(
+                                        TransportError::new("transaction aborted", SqlxError::Protocol("transaction aborted".to_string()))
+                                    )));
+                                }
+                                Err(insert_err)
+                            }
+                        }
                     }
                 }
             } else {
-                insert_batch(&self.pool, table, values).await
+                debug!(table = %table, "using INSERT batch insert");
+                match insert_batch(&mut tx, table, values).await {
+                    Ok(_) => Ok(()),
+                    Err(err) => {
+                        // Check if this is an aborted transaction error
+                        let err_msg = err.to_string();
+                        if err_msg.contains("current transaction is aborted") {
+                            warn!(table = %table, error = %err, "transaction aborted during INSERT, will retry with fresh transaction");
+                            return Err(backoff::Error::transient(ProcessingError::from(
+                                TransportError::new("transaction aborted", SqlxError::Protocol("transaction aborted".to_string()))
+                            )));
+                        }
+                        Err(err)
+                    }
+                }
             };
 
-            res.map_err(|e| {
-                if e.is_retryable() {
-                    backoff::Error::transient(e)
-                } else {
-                    backoff::Error::permanent(e)
+            match res {
+                Ok(_) => {
+                    info!(batch_size = values.len(), table = %table, "batch insert succeeded");
+                    // Calculate max offsets
+                    let mut max_offsets: std::collections::HashMap<(String, i64), i64> =
+                        std::collections::HashMap::new();
+                    for val in values {
+                        let meta = RecordMeta::extract(val);
+                        let key = (meta.topic.clone(), meta.partition);
+                        let current_max = max_offsets.entry(key).or_insert(-1);
+                        if meta.offset > *current_max {
+                            *current_max = meta.offset;
+                        }
+                    }
+
+                    // Write offsets
+                    for ((topic, partition), offset) in max_offsets {
+                        // Validate partition fits in i32 to prevent overflow
+                        let partition_i32 = i32::try_from(partition).map_err(|_| {
+                            backoff::Error::permanent(ProcessingError::Validation(
+                                crate::errors::ValidationError::new(format!(
+                                    "partition {} exceeds i32 bounds",
+                                    partition
+                                )),
+                            ))
+                        })?;
+
+                        if let Err(e) = OffsetTracker::write_offset_with_conn(
+                            &mut tx,
+                            "default",
+                            pipeline_name,
+                            &topic,
+                            partition_i32,
+                            offset,
+                        )
+                        .await
+                        {
+                            // Check if this is a retryable transport error
+                            let error_msg = format!("offset tracking error: {}", e);
+                            if let Ok(sqlx_err) = e.downcast::<SqlxError>() {
+                                let transport_err =
+                                    TransportError::new("offset tracking", sqlx_err);
+                                if transport_err.is_retryable() {
+                                    return Err(backoff::Error::transient(ProcessingError::from(
+                                        transport_err,
+                                    )));
+                                }
+                            }
+                            // Not a retryable transport error, treat as permanent validation error
+                            return Err(backoff::Error::permanent(ProcessingError::Validation(
+                                ValidationError::new(error_msg),
+                            )));
+                        }
+                    }
+
+                    if let Err(e) = tx.commit().await {
+                        return Err(backoff::Error::transient(ProcessingError::from(
+                            TransportError::new("pg commit", e),
+                        )));
+                    }
+                    Ok(())
                 }
-            })
+                Err(e) => {
+                    if e.is_retryable() {
+                        Err(backoff::Error::transient(e))
+                    } else {
+                        Err(backoff::Error::permanent(e))
+                    }
+                }
+            }
         };
 
-        let backoff = ExponentialBackoff::default();
+        let backoff = self.retry_cfg.build_backoff();
         let res = retry(backoff, op).await;
 
         timer.observe_duration();
 
+        // Track retry metrics
+        let attempts = attempt_count.load(Ordering::SeqCst);
+        self.metrics.retry_attempts.observe(attempts as f64);
         match &res {
             Ok(_) => {
+                if attempts > 1 {
+                    self.metrics
+                        .retry_success_after_n_attempts
+                        .with_label_values(&[&attempts.to_string()])
+                        .inc();
+                }
                 let _ = self.health.set_postgres_status(ComponentStatus::Healthy);
                 let _ = self.health.update_pipeline_success(pipeline_name);
             }
@@ -364,11 +523,9 @@ async fn copy_into(
     validate_table_identifier(table)
         .map_err(|e| ProcessingError::Validation(ValidationError::new(e.to_string())))?;
 
-    // Escape any double quotes in table name and wrap in quotes for safe SQL identifier
-    let quoted_table = format!("\"{}\"", table.replace('"', "\"\""));
     let copy_sql = format!(
         "COPY {} (payload, ingest_system_time, _meta_topic, _meta_partition, _meta_offset, _meta_ingest_ts) FROM STDIN WITH (FORMAT csv)",
-        quoted_table
+        table
     );
     let mut writer = conn
         .copy_in_raw(&copy_sql)
@@ -383,7 +540,7 @@ async fn copy_into(
         let mut wtr = CsvWriter::from_writer(vec![]);
         wtr.write_record([
             json.as_str(),
-            &Utc::now().timestamp_millis().to_string(),
+            &Utc::now().to_rfc3339(),
             &meta.topic,
             &meta.partition.to_string(),
             &meta.offset.to_string(),
@@ -411,7 +568,11 @@ async fn copy_into(
     Ok(())
 }
 
-async fn insert_batch(pool: &PgPool, table: &str, values: &[Value]) -> Result<(), ProcessingError> {
+async fn insert_batch(
+    conn: &mut PgConnection,
+    table: &str,
+    values: &[Value],
+) -> Result<(), ProcessingError> {
     if values.is_empty() {
         return Ok(());
     }
@@ -420,11 +581,9 @@ async fn insert_batch(pool: &PgPool, table: &str, values: &[Value]) -> Result<()
     validate_table_identifier(table)
         .map_err(|e| ProcessingError::Validation(ValidationError::new(e.to_string())))?;
 
-    // Escape any double quotes in table name and wrap in quotes for safe SQL identifier
-    let quoted_table = format!("\"{}\"", table.replace('"', "\"\""));
     let mut builder = QueryBuilder::new(format!(
-        "INSERT INTO {} (payload, ingest_system_time, _meta_topic, _meta_partition, _meta_offset, _meta_ingest_ts) VALUES ",
-        quoted_table
+        "INSERT INTO {} (payload, ingest_system_time, _meta_topic, _meta_partition, _meta_offset, _meta_ingest_ts) ",
+        table
     ));
 
     builder.push_values(values, |mut b, val| {
@@ -440,7 +599,7 @@ async fn insert_batch(pool: &PgPool, table: &str, values: &[Value]) -> Result<()
 
     let query = builder.build();
     query
-        .execute(pool)
+        .execute(conn)
         .await
         .map_err(|e| ProcessingError::from(TransportError::new("insert", e)))?;
     Ok(())
@@ -563,7 +722,7 @@ mod tests {
         let mut wtr = CsvWriter::from_writer(vec![]);
         wtr.write_record(&[
             json_payload.as_str(),
-            &Utc::now().timestamp_millis().to_string(),
+            &Utc::now().to_rfc3339(),
             &meta.topic,
             &meta.partition.to_string(),
             &meta.offset.to_string(),

@@ -1,5 +1,7 @@
+#![allow(clippy::collapsible_if)]
 use crate::eip::PipelineConfig;
-use anyhow::{bail, ensure, Context, Result};
+use crate::retry::RetryConfig;
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
@@ -12,6 +14,15 @@ pub enum LogLevel {
     Info,
     Warn,
     Error,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CopyFormat {
+    #[default]
+    Csv,
+    Binary,
+    Text,
 }
 
 impl std::fmt::Display for LogLevel {
@@ -47,6 +58,8 @@ pub struct ServiceConfig {
     pub health_check_timeout_ms: u64,
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout: String,
+    #[serde(default)]
+    pub memory: MemoryConfig,
 }
 
 fn default_health_check_timeout_ms() -> u64 {
@@ -55,6 +68,35 @@ fn default_health_check_timeout_ms() -> u64 {
 
 fn default_shutdown_timeout() -> String {
     "30s".to_string()
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MemoryConfig {
+    #[serde(default = "default_max_memory_mb")]
+    pub max_memory_mb: u64,
+    #[serde(default = "default_memory_check_interval_ms")]
+    pub memory_check_interval_ms: u64,
+}
+
+fn default_max_memory_mb() -> u64 {
+    1024 // 1GB default
+}
+
+fn default_memory_check_interval_ms() -> u64 {
+    1000 // 1 second
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            max_memory_mb: default_max_memory_mb(),
+            memory_check_interval_ms: default_memory_check_interval_ms(),
+        }
+    }
+}
+
+fn default_copy_buffer_size() -> usize {
+    65536 // 64KB
 }
 
 impl ServiceConfig {
@@ -124,6 +166,7 @@ mod tests {
             otlp_endpoint: None,
             health_check_timeout_ms: 5000,
             shutdown_timeout: "60s".to_string(),
+            memory: MemoryConfig::default(),
         };
         let dur = svc.shutdown_timeout_duration();
         assert_eq!(dur.as_secs(), 60);
@@ -148,9 +191,10 @@ mod tests {
         let svc = ServiceConfig {
             log_level: LogLevel::Debug,
             metrics_port: 8080,
-            otlp_endpoint: Some("http://localhost:4317".to_string()),
+            otlp_endpoint: Some("http://localhost:4317/".to_string()),
             health_check_timeout_ms: 3000,
             shutdown_timeout: "30s".to_string(),
+            memory: MemoryConfig::default(),
         };
         assert_eq!(svc.metrics_port, 8080);
         assert!(svc.otlp_endpoint.is_some());
@@ -190,12 +234,16 @@ mod tests {
             ssl_mode: None,
             ssl_root_cert: None,
             pool: Some(PostgresPoolConfig {
-                max_connections: 20,
-                acquire_timeout_ms: 10000,
+                max_connections: 10,
+                acquire_timeout_ms: 5000,
             }),
+            per_pipeline_pools: false,
             copy_enabled: true,
+            copy_format: CopyFormat::Csv,
+            copy_buffer_size: 65536,
             copy_batch_rows: 1000,
             insert_batch_rows: 100,
+            enable_offset_tracking: false,
         };
         assert!(cfg.validate().is_ok());
     }
@@ -210,9 +258,31 @@ mod tests {
                 max_connections: 0,
                 acquire_timeout_ms: 10000,
             }),
+            per_pipeline_pools: false,
             copy_enabled: true,
+            copy_format: CopyFormat::Csv,
+            copy_buffer_size: 65536,
             copy_batch_rows: 1000,
             insert_batch_rows: 100,
+            enable_offset_tracking: false,
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_postgres_config_validation_zero_copy_buffer_size() {
+        let cfg = PostgresConfig {
+            url: "postgres://localhost/db".to_string(),
+            ssl_mode: None,
+            ssl_root_cert: None,
+            pool: None,
+            per_pipeline_pools: false,
+            copy_enabled: true,
+            copy_format: CopyFormat::Csv,
+            copy_buffer_size: 0,
+            copy_batch_rows: 1000,
+            insert_batch_rows: 100,
+            enable_offset_tracking: false,
         };
         assert!(cfg.validate().is_err());
     }
@@ -342,6 +412,20 @@ mod tests {
     fn test_config_validation_zero_health_check_timeout() {
         let mut cfg = create_valid_config();
         cfg.service.health_check_timeout_ms = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_zero_max_memory_mb() {
+        let mut cfg = create_valid_config();
+        cfg.service.memory.max_memory_mb = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_zero_memory_check_interval_ms() {
+        let mut cfg = create_valid_config();
+        cfg.service.memory.memory_check_interval_ms = 0;
         assert!(cfg.validate().is_err());
     }
 
@@ -478,6 +562,7 @@ mod tests {
                 otlp_endpoint: None,
                 health_check_timeout_ms: 5000,
                 shutdown_timeout: "30s".to_string(),
+                memory: MemoryConfig::default(),
             },
             kafka: KafkaConfig {
                 brokers: "localhost:9092".to_string(),
@@ -501,10 +586,15 @@ mod tests {
                     max_connections: 10,
                     acquire_timeout_ms: 5000,
                 }),
+                per_pipeline_pools: false,
                 copy_enabled: true,
+                copy_format: CopyFormat::Csv,
+                copy_buffer_size: 65536,
                 copy_batch_rows: 5000,
                 insert_batch_rows: 500,
+                enable_offset_tracking: false,
             },
+            retry: RetryConfig::default(),
             pipelines: vec![PipelineConfig {
                 name: "test-pipeline".to_string(),
                 topic: "test-topic".to_string(),
@@ -517,6 +607,9 @@ mod tests {
                     channel_capacity: 20000,
                 },
                 batching: Default::default(),
+                circuit_breaker: Default::default(),
+                worker_threads: 1,
+                multi_tenancy: None,
             }],
         }
     }
@@ -601,9 +694,39 @@ pub struct PostgresConfig {
     pub ssl_root_cert: Option<String>,
     #[serde(default)]
     pub pool: Option<PostgresPoolConfig>,
+    #[serde(default)]
+    pub per_pipeline_pools: bool,
     pub copy_enabled: bool,
+    #[serde(default)]
+    pub copy_format: CopyFormat,
+    #[serde(default = "default_copy_buffer_size")]
+    pub copy_buffer_size: usize,
     pub copy_batch_rows: usize,
     pub insert_batch_rows: usize,
+    /// Enable offset tracking for exactly-once semantics (default: false).
+    ///
+    /// When enabled, the application persists Kafka partition offsets to the database alongside
+    /// data writes, enabling recovery from the last successfully processed offset on restart.
+    /// This provides exactly-once delivery guarantees by tracking progress per (pipeline, topic, partition).
+    ///
+    /// **When to enable:**
+    /// - Require exactly-once semantics and cannot tolerate message replay on crash/restart
+    /// - Using long-running pipelines with potential recovery scenarios
+    /// - Need to preserve offset state across service restarts
+    ///
+    /// **Performance implications:**
+    /// - Minimal CPU overhead (single SQL insert/update per batch)
+    /// - Database disk I/O: Additional writes to offset_tracker table (1 row per partition per flush)
+    /// - Memory: Negligible (offset_tracker maintains minimal state per pipeline)
+    /// - Network: Single extra request per flush (batched with data writes in same transaction)
+    ///
+    /// **Operational notes:**
+    /// - Requires offset_tracker table in Postgres database (created during init)
+    /// - Offsets persisted atomically with data writes (same transaction)
+    /// - If disabled: offsets tracked only in Kafka group state (at-least-once semantics)
+    /// - Query `SELECT * FROM offset_tracker` for debugging or monitoring offset state
+    #[serde(default)]
+    pub enable_offset_tracking: bool,
 }
 
 impl PostgresConfig {
@@ -611,6 +734,12 @@ impl PostgresConfig {
         if let Some(ref pool) = self.pool {
             pool.validate()?;
         }
+
+        ensure!(
+            self.copy_buffer_size > 0,
+            "copy_buffer_size must be greater than 0"
+        );
+
         Ok(())
     }
 }
@@ -620,6 +749,8 @@ pub struct Config {
     pub service: ServiceConfig,
     pub kafka: KafkaConfig,
     pub postgres: PostgresConfig,
+    #[serde(default)]
+    pub retry: RetryConfig,
     pub pipelines: Vec<PipelineConfig>,
 }
 
@@ -684,6 +815,12 @@ impl Config {
     fn validate(&self) -> Result<()> {
         self.postgres.validate()?;
 
+        // Validate retry configuration
+        self.retry
+            .validate()
+            .map_err(|e| anyhow::anyhow!(e))
+            .context("retry config invalid")?;
+
         ensure!(
             self.service.metrics_port > 0,
             "service.metrics_port must be greater than zero"
@@ -692,6 +829,16 @@ impl Config {
         ensure!(
             self.service.health_check_timeout_ms > 0,
             "health_check_timeout_ms must be greater than 0"
+        );
+
+        ensure!(
+            self.service.memory.max_memory_mb > 0,
+            "service.memory.max_memory_mb must be greater than 0"
+        );
+
+        ensure!(
+            self.service.memory.memory_check_interval_ms > 0,
+            "service.memory.memory_check_interval_ms must be greater than 0"
         );
 
         ensure!(
@@ -830,14 +977,143 @@ pub fn validate_table_identifier(table: &str) -> Result<&str> {
     }
 
     if !valid_part(first) {
-        bail!("staging_table must start with a letter or underscore, contain only alphanumerics/underscores, and be <= 63 characters");
+        bail!(
+            "staging_table must start with a letter or underscore, contain only alphanumerics/underscores, and be <= 63 characters"
+        );
     }
 
     if let Some(schema_or_table) = second {
         if !valid_part(schema_or_table) {
-            bail!("staging_table schema/table parts must start with a letter or underscore, contain only alphanumerics/underscores, and be <= 63 characters");
+            bail!(
+                "staging_table schema/table parts must start with a letter or underscore, contain only alphanumerics/underscores, and be <= 63 characters"
+            );
         }
     }
 
     Ok(table)
+}
+
+/// Validate a tenant identifier for safe use in table name construction.
+///
+/// Tenant IDs are used as suffixes in table names (e.g., "users_tenant123").
+/// They must be safe for concatenation and SQL identifier use.
+///
+/// # Parameters
+///
+/// - `tenant_id`: The tenant identifier string to validate
+///
+/// # Returns
+///
+/// `Ok(&str)` with the validated tenant ID if valid, `Err` with a descriptive error if invalid.
+///
+/// # Validation Rules
+///
+/// - Must not be empty
+/// - Must be <= 32 characters (reasonable limit for tenant IDs)
+/// - Must start with a letter or underscore
+/// - Must contain only ASCII alphanumeric characters and underscores
+/// - Must not contain SQL injection characters (no quotes, semicolons, etc.)
+///
+/// # Examples
+///
+/// ```
+/// assert!(validate_tenant_identifier("tenant123").is_ok());
+/// assert!(validate_tenant_identifier("tenant_123").is_ok());
+/// assert!(validate_tenant_identifier("_tenant").is_ok());
+/// assert!(validate_tenant_identifier("").is_err()); // empty
+/// assert!(validate_tenant_identifier("123tenant").is_err()); // starts with number
+/// assert!(validate_tenant_identifier("tenant-123").is_err()); // dash not allowed
+/// assert!(validate_tenant_identifier("tenant;drop").is_err()); // injection attempt
+/// ```
+pub fn validate_tenant_identifier(tenant_id: &str) -> Result<&str> {
+    if tenant_id.is_empty() {
+        bail!("tenant_id must not be empty");
+    }
+
+    if tenant_id.len() > 32 {
+        bail!("tenant_id must be <= 32 characters");
+    }
+
+    let mut chars = tenant_id.chars();
+    let first = match chars.next() {
+        Some(c) => c,
+        None => return Ok(tenant_id), // This shouldn't happen due to empty check above
+    };
+
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        bail!(
+            "tenant_id must start with a letter or underscore, contain only alphanumerics/underscores"
+        );
+    }
+
+    if !chars.all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+        bail!("tenant_id must contain only ASCII alphanumeric characters and underscores");
+    }
+
+    // Additional SQL injection protection
+    if tenant_id.contains('\'')
+        || tenant_id.contains('"')
+        || tenant_id.contains(';')
+        || tenant_id.contains('\\')
+        || tenant_id.contains('\n')
+        || tenant_id.contains('\r')
+        || tenant_id.contains('\t')
+    {
+        bail!("tenant_id contains invalid characters");
+    }
+
+    Ok(tenant_id)
+}
+
+#[cfg(test)]
+mod tenant_validation_tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_tenant_identifier_valid() {
+        assert!(validate_tenant_identifier("tenant123").is_ok());
+        assert!(validate_tenant_identifier("tenant_123").is_ok());
+        assert!(validate_tenant_identifier("_tenant").is_ok());
+        assert!(validate_tenant_identifier("a").is_ok());
+        assert!(validate_tenant_identifier("tenant").is_ok());
+        assert!(validate_tenant_identifier("TENANT").is_ok());
+    }
+
+    #[test]
+    fn test_validate_tenant_identifier_empty() {
+        assert!(validate_tenant_identifier("").is_err());
+    }
+
+    #[test]
+    fn test_validate_tenant_identifier_too_long() {
+        let long_id = "a".repeat(33);
+        assert!(validate_tenant_identifier(&long_id).is_err());
+    }
+
+    #[test]
+    fn test_validate_tenant_identifier_invalid_start() {
+        assert!(validate_tenant_identifier("123tenant").is_err());
+        assert!(validate_tenant_identifier("-tenant").is_err());
+        assert!(validate_tenant_identifier(" tenant").is_err());
+    }
+
+    #[test]
+    fn test_validate_tenant_identifier_invalid_chars() {
+        assert!(validate_tenant_identifier("tenant-123").is_err()); // dash
+        assert!(validate_tenant_identifier("tenant 123").is_err()); // space
+        assert!(validate_tenant_identifier("tenant.123").is_err()); // dot
+        assert!(validate_tenant_identifier("tenant/123").is_err()); // slash
+        assert!(validate_tenant_identifier("tenant@123").is_err()); // at
+    }
+
+    #[test]
+    fn test_validate_tenant_identifier_sql_injection() {
+        assert!(validate_tenant_identifier("tenant;drop").is_err()); // semicolon
+        assert!(validate_tenant_identifier("tenant'drop").is_err()); // quote
+        assert!(validate_tenant_identifier("tenant\"drop").is_err()); // double quote
+        assert!(validate_tenant_identifier("tenant\\drop").is_err()); // backslash
+        assert!(validate_tenant_identifier("tenant\ndrop").is_err()); // newline
+        assert!(validate_tenant_identifier("tenant\rdrop").is_err()); // carriage return
+        assert!(validate_tenant_identifier("tenant\tdrop").is_err()); // tab
+    }
 }

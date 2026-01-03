@@ -1,7 +1,7 @@
 [package]
 name = "rcl"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
@@ -13,6 +13,7 @@ clap = { version = "4.4", features = ["derive", "env"] }
 csv = "1.3"
 dotenvy = "0.15"
 futures = "0.3"
+parking_lot = "0.12"
 percent-encoding = "2.3.2"
 prometheus = "0.13"
 rdkafka = { version = "0.36", features = ["cmake-build"] }
@@ -31,6 +32,6 @@ opentelemetry-otlp = "0.14"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1.6", features = ["v4"] }
 redis = { version = "0.25", features = ["tokio-comp"] }
-
-[dev-dependencies]
+memory-stats = "1.1"
+sysinfo = "0.30"
 serial_test = "3.2.0"

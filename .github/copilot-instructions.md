@@ -22,6 +22,8 @@ Rust-based CDC (Change Data Capture) pipeline: Kafka → Debezium decoder → EI
 - [Health Registry](src/health.rs): Tracks Kafka/Postgres/pipeline statuses via `ComponentStatus` (Healthy/Degraded/Unhealthy).
 - [Shutdown Coordinator](src/shutdown.rs): Broadcast channel for graceful shutdown signals to all tasks.
 - [Metrics](src/metrics.rs): Prometheus metrics with HTTP endpoints (`/metrics`, `/health`, `/ready`).
+- [Offset Tracker](src/offset_tracker.rs): Persists consumed offsets to Postgres `offset_tracker` table for recovery on restart (exactly-once semantics).
+- [Retry Strategy](src/retry.rs): Exponential backoff with jitter for retryable errors (TransportError).
 - [OpenTelemetry Integration](otel-collector-config.yaml): Distributed tracing support via OTLP endpoint.
 
 ## 🛠 Developer Workflow
@@ -47,7 +49,8 @@ Rust-based CDC (Change Data Capture) pipeline: Kafka → Debezium decoder → EI
 - `cargo run -- load-test [--rate <rate>] [--duration-sec <seconds>]` - Generate synthetic load (default: 1000 msg/sec, 60 sec)
 
 **Database Notes:**
-- Schema in `sql/staging_tables.sql` defines table structure.
+- Schema in `sql/staging_tables.sql` defines staging table structure.
+- Offset tracking table (`offset_tracker`) auto-created during Writer initialization (see `sql/offset_tracker.sql`).
 - Use `sqlx::query()` (runtime) not `sqlx::query!()` (compile-time) because table names are dynamic (staging pattern).
 - `RecordMeta::extract(value)` pulls metadata (`_meta_topic`, `_meta_partition`, `_meta_offset`, `_meta_ingest_ts`) + `operation_type` from JSON.
 
@@ -145,6 +148,30 @@ Batching enables efficient `COPY` bulk inserts. Failed batches are caught early;
 - Use `ShutdownCoordinator::subscribe()` to receive shutdown signals; tasks must respect signal + timeout.
 - `ReceiverStream` wraps `mpsc::Receiver` for stream-like iteration.
 
+### Circuit Breaker & Resilience (`src/circuit_breaker.rs`)
+Prevents cascading failures by tracking pipeline health via three states (Closed → Open → Half-Open):
+- **Closed** (normal): Requests pass through; failures tracked. Opens if `failure_threshold` consecutive failures occur (absolute count since last state transition, not time-windowed). Failure counter resets on state transition.
+- **Open** (failing): All requests rejected immediately with `CircuitBreakerError`. Remains Open for `half_open_timeout_ms` (duration in Open state before allowing limited trials), then transitions to Half-Open.
+- **Half-Open** (recovery): Limited requests allowed to test recovery. Closes if `success_threshold` consecutive successes occur (absolute count since entering Half-Open, reset on state transition); reopens immediately on first failure.
+- **Success/Failure semantics**: A "success" is a downstream operation completing without error (i.e., post-processing completion), independent of circuit breaker checks. Failures are retryable errors (TransportError) that indicate transient issues.
+- **Threshold counts**: Both `failure_threshold` and `success_threshold` are counts per state transition, NOT time-windowed or rate-based. Counters reset when state changes. To implement windowed or rate-based semantics, the `src/circuit_breaker.rs` implementation must be updated.
+- Configured per-pipeline via `pipeline.circuit_breaker`. Call `circuit_breaker.try_execute()` before processing, `record_success()`/`record_failure()` after.
+
+### Worker Pool & Parallel Processing (`src/worker_pool.rs`)
+Enables per-pipeline parallelism via `pipeline.worker_threads`:
+- **Default (1 thread)**: Sequential processing, preserves strict ordering within partition.
+- **Multiple threads (worker_threads > 1)**: Parallel message processing with controlled concurrency per pipeline. **Important**: With multiple threads, ordering across messages in the same partition is NOT guaranteed unless additional per-key ordering coordination is implemented. Messages are distributed to workers via round-robin, so concurrent processing may reorder partition messages. (See ordering guarantees section below.)
+- **Work-claiming**: Each message is locked/claimed by one worker thread when fetched from the shared channel. Retries for that message are handled by the same worker, preventing concurrent retries of the same message (critical for idempotency).
+- `WorkerPoolCoordinator` manages spawn/shutdown of worker threads; respects `ShutdownCoordinator` signals.
+- **Error routing and retry semantics** (see also lines 57–61):
+  - **Permanent errors** (ValidationError, ProcessingError, DebeziumError): Immediately routed to DLQ, not retried.
+  - **Retryable errors** (TransportError): Applied exponential backoff via retry logic (lines 57–61). If all retries exhausted, then routed to DLQ.
+  - **Circuit breaker interaction**: Open circuit short-circuits retry attempts; messages may fail-fast or escalate to DLQ according to pipeline policy.
+  - **Stage-level `retryable` flag** (line 114): `StageError.retryable` is consulted by pipeline-level policies but does not override them; it informs whether an error instance is considered retryable.
+- **Ordering guarantees**: With `worker_threads=1`, strict per-partition ordering is preserved. With `worker_threads>1`, ordering is not guaranteed. If ordering-by-key is required, implement additional coordination (e.g., shard work by key) or document configuration/code paths enforcing it.
+- **Router stage interaction with ordering**: RouterStage injects `_meta_table` and may override destination table; this does not re-route to different partitions but may affect DLQ routing if retries differ per stage configuration.
+
+
 ### Logging & Observability
 - Use `tracing::{info!, warn!, error!}` macros with structured fields.
 - **Always include context**: `warn!(context = %ctx.correlation_id(), topic = %topic, error = %err, "...")`.
@@ -208,20 +235,26 @@ Batching enables efficient `COPY` bulk inserts. Failed batches are caught early;
 
 **Pipeline Configuration:**
 - `pipelines[]` - Array of pipeline definitions
-  - `name` - Pipeline identifier (unique)
-  - `topic` - Kafka topic to consume (unique per pipeline)
-  - `debezium_envelope` - Enable Debezium envelope unwrapping (default: false)
-  - `staging_table` - Target table name (validated for SQL injection)
-  - `required_fields[]` - Fields required in every message
-  - `backpressure.channel_capacity` - Message buffer size (default: 20000)
+  - `name` - Pipeline identifier (unique, required)
+  - `topic` - Kafka topic to consume (unique per pipeline, required)
+  - `debezium_envelope` - Enable Debezium envelope unwrapping (type: boolean, default: false)
+  - `staging_table` - Target table name (required, validated for SQL injection)
+  - `required_fields[]` - Fields required in every message (type: array of strings, optional)
+  - `backpressure.channel_capacity` - Message buffer size per pipeline (type: integer ≥ 1; default: 20000; **semantics**: this is a per-pipeline global limit shared across all worker threads, not per-thread; capacity influences backpressure on Kafka consumer—if channel full, fetch loop blocks, slowing consumption)
+  - `worker_threads` - Number of worker threads for parallel message processing (type: integer ≥ 1; default: 1; **validation**: must be positive; 0 or negative values invalid)
+  - `circuit_breaker` - Fault tolerance configuration (optional; if omitted, defaults to: enabled=true, failure_threshold=10, success_threshold=5, half_open_timeout_ms=30000)
+    - `enabled` - Enable circuit breaker (type: boolean, default: true)
+    - `failure_threshold` - Consecutive failures required to Open circuit (type: integer ≥ 1, absolute count per transition, not windowed; default: 10)
+    - `success_threshold` - Consecutive successes required to Close circuit (type: integer ≥ 1, absolute count per transition, not windowed; default: 5)
+    - `half_open_timeout_ms` - Duration to remain Open before transitioning to Half-Open to allow trial requests (type: integer ≥ 1, milliseconds; default: 30000)
   - `dlq` - Dead letter queue configuration (optional)
-    - `topic` - DLQ topic name
-    - `max_retries` - Retry attempts before DLQ (default: 3)
-    - `max_payload_bytes` - Max DLQ message size (default: 1MB)
-  - `stages[]` - EIP pipeline stages
-    - `type` - Stage type (filter/transformer/router/splitter/idempotent_receiver)
-    - `name` - Stage identifier
-    - `config` - Stage-specific configuration (varies by type)
+    - `topic` - DLQ topic name (required if dlq specified)
+    - `max_retries` - Retry attempts before DLQ (type: integer ≥ 0, default: 3)
+    - `max_payload_bytes` - Max DLQ message size (type: integer ≥ 1, default: 1MB)
+  - `stages[]` - EIP pipeline stages (type: array, required)
+    - `type` - Stage type (required, enum: filter/transformer/router/splitter/idempotent_receiver)
+    - `name` - Stage identifier (required)
+    - `config` - Stage-specific configuration (varies by type, required for each stage)
       - **filter** stage: `field`, `operator` (equals/regex/contains/in), `value`, `mode` (include/exclude), `logic` (AND/OR for multiple conditions)
       - **transformer** stage: `operations` (array of rename/copy/extract/convert/default operations), `fields` (field config)
       - **router** stage: `field` (routing key), `routes` (table name mappings)
@@ -360,11 +393,12 @@ curl http://localhost:9090/metrics | grep -E "(lag_ms|processing_failures|messag
 
 ## ⚠️ Critical Implementation Details
 
-### Retry Logic & Resilience
-- `TransportError` only: Use `backoff::future::retry()` with `ExponentialBackoff` (configured in `writer.rs`).
-- Jitter prevents thundering herd when Postgres recovers.
+### Only `TransportError` is retried
+Use `backoff::future::retry()` with `ExponentialBackoff` (configured in `src/retry.rs` and `writer.rs`).
+- Exponential backoff policy: starts at ~1ms, doubles each retry, includes jitter to prevent thundering herd when Postgres recovers.
 - Max retries prevent infinite loops on permanent failures (e.g., table doesn't exist).
 - If all retries exhausted: `ProcessingError` sent to DLQ, offset committed (poison pill protection).
+- **Permanent errors** (ValidationError, ProcessingError, DebeziumError) skip retry and route directly to DLQ
 
 ### Writer Fallback Strategy
 1. Try `INSERT ... SELECT COPY` (bulk insert).
@@ -372,10 +406,11 @@ curl http://localhost:9090/metrics | grep -E "(lag_ms|processing_failures|messag
 3. If INSERT fails: Emit `ProcessingError` → DLQ.
 - Metadata extraction via `RecordMeta::extract()` must occur BEFORE writing to preserve correlation.
 
-### Consumer Offset Management
-- Offsets committed ONLY after successful DB write (at-least-once semantics).
+### Consumer Offset Management, exactly-once with idempotent writes).
+- `OffsetTracker` persists partition offsets to Postgres `offset_tracker` table for recovery on restart.
 - On consumer lag spike: Health registry marks Kafka as `Degraded` (staleness > `health_check_timeout_ms`).
-- Replay mode (`cargo run -- replay`) allows re-processing messages by seeking to specific offsets.
+- Replay mode (`cargo run -- replay`) allows re-processing messages by seeking to specific offsets without affecting stored offset state.
+- Query `SELECT * FROM offset_tracker` to inspect stored offset state per pipeline/topic/partition.
 
 ### Metrics Tracking
 Update `src/metrics.rs` for:

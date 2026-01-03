@@ -1,5 +1,5 @@
 //! Integration tests for Phase 2.4: Basic Integration Verification
-//! 
+//!
 //! This module validates:
 //! 1. Graceful shutdown behavior (ensure no message loss)
 //! 2. Batching correctness (flush intervals and size triggers)
@@ -12,9 +12,8 @@
 mod tests {
     use crate::shutdown::ShutdownCoordinator;
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-    use tokio::time::{sleep, Duration};
+    use std::sync::atomic::Ordering;
+    use tokio::time::Duration;
 
     // ============================================================================
     // VERIFICATION 2.4.1: Graceful Shutdown Behavior
@@ -53,16 +52,16 @@ mod tests {
     fn test_batcher_configuration_exists() {
         // This test validates that batching infrastructure is properly configured
         // In a real scenario, this would be expanded with actual Postgres/Kafka integration
-        
+
         // BatcherConfig has configurable flush intervals
         // BatcherConfig has configurable batch sizes
         // BatcherConfig has configurable byte limits
-        
+
         // These mechanisms enable:
         // - Time-based flush (flush_interval_ms)
         // - Size-based flush (max_batch_size)
         // - Byte-size-based flush (max_batch_bytes)
-        
+
         assert!(true, "✓ Batcher configuration structure exists");
     }
 
@@ -237,35 +236,36 @@ mod tests {
             "retryable": false
         });
 
-        assert!(retryable_error
-            .get("retryable")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false));
+        assert!(
+            retryable_error
+                .get("retryable")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        );
 
-        assert!(!permanent_error
-            .get("retryable")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false));
+        assert!(
+            !permanent_error
+                .get("retryable")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        );
     }
 
     /// Test DLQ with metadata preservation
     #[test]
     fn test_dlq_metadata_preservation() {
         let metadata = json!({
-            "topic": "cdc.orders",
+            "topic": "cdc.example",
             "partition": 2,
             "offset": 5000,
             "ingest_timestamp": 1700000000000i64,
-            "correlation_id": "cdc.orders:2:5000"
+            "correlation_id": "cdc.example:2:5000"
         });
 
         // All required metadata fields should be present
         assert_eq!(
-            metadata
-                .get("topic")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "cdc.orders"
+            metadata.get("topic").and_then(|v| v.as_str()).unwrap_or(""),
+            "cdc.example"
         );
         assert_eq!(
             metadata
@@ -275,10 +275,7 @@ mod tests {
             2
         );
         assert_eq!(
-            metadata
-                .get("offset")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0),
+            metadata.get("offset").and_then(|v| v.as_i64()).unwrap_or(0),
             5000
         );
         assert_eq!(
@@ -286,7 +283,7 @@ mod tests {
                 .get("correlation_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or(""),
-            "cdc.orders:2:5000"
+            "cdc.example:2:5000"
         );
     }
 
@@ -362,7 +359,7 @@ mod tests {
     #[tokio::test]
     async fn test_phase_2_4_verification_summary() {
         // This test serves as a checklist for Phase 2.4 completion
-        
+
         // 2.4.1: Graceful shutdown - can create and subscribe to coordinator
         let (coordinator, _) = ShutdownCoordinator::new();
         let _rx = coordinator.subscribe();
@@ -382,8 +379,14 @@ mod tests {
             "metadata": { "topic": "test" }
         });
         assert!(dlq_msg.get("value").is_some(), "✓ 2.4.3a: DLQ has payload");
-        assert!(dlq_msg.get("error").is_some(), "✓ 2.4.3b: DLQ has error info");
-        assert!(dlq_msg.get("metadata").is_some(), "✓ 2.4.3c: DLQ has metadata");
+        assert!(
+            dlq_msg.get("error").is_some(),
+            "✓ 2.4.3b: DLQ has error info"
+        );
+        assert!(
+            dlq_msg.get("metadata").is_some(),
+            "✓ 2.4.3c: DLQ has metadata"
+        );
 
         // 2.4.4: Per-pipeline isolation - separate buffer management
         // - Each pipeline has own buffer key (pipeline:table)

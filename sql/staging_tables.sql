@@ -1,20 +1,19 @@
--- Example staging table for Debezium-wrapped orders payloads
+-- Example staging table for Debezium-wrapped orders payloads with multi-tenancy support
 CREATE TABLE IF NOT EXISTS stg_orders (
+    tenant_id TEXT NOT NULL,
     payload JSONB NOT NULL,
     ingest_system_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    _meta_topic TEXT,
-    _meta_partition BIGINT,
-    _meta_offset BIGINT,
-    _meta_ingest_ts BIGINT,
-    order_id TEXT GENERATED ALWAYS AS (payload ->> 'order_id') STORED,
-    op_ts TIMESTAMPTZ GENERATED ALWAYS AS ((payload ->> 'op_ts')::timestamptz) STORED,
-    operation_type TEXT GENERATED ALWAYS AS (payload ->> 'operation_type') STORED,
-    CHECK (payload ? 'order_id'),
-    CHECK (payload ? 'op_ts'),
-    CONSTRAINT stg_orders_op_ts_valid CHECK (
-        (payload ->> 'op_ts') IS NOT NULL
-        AND (payload ->> 'op_ts') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$'
-    ),
-    CHECK (payload ? 'operation_type'),
-    PRIMARY KEY (order_id, op_ts, operation_type)
+    _meta_topic TEXT NOT NULL,
+    _meta_partition BIGINT NOT NULL,
+    _meta_offset BIGINT NOT NULL,
+    _meta_ingest_ts BIGINT DEFAULT (EXTRACT(EPOCH FROM NOW()) * 1000)::BIGINT,
+
+    -- Composite primary key for idempotent writes and deduplication (includes tenant_id)
+    PRIMARY KEY (tenant_id, _meta_topic, _meta_partition, _meta_offset)
 );
+
+-- Index for time-range queries during downstream processing
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_stg_orders_ingest_time ON stg_orders (ingest_system_time);
+
+-- Index for tenant-specific queries
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_stg_orders_tenant_id ON stg_orders (tenant_id);

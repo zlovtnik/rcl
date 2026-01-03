@@ -6,6 +6,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use tracing::{debug, error, info};
 
 /// Core abstractions for Enterprise Integration Patterns
 
@@ -79,7 +80,7 @@ impl StageError {
 pub trait Stage: Send + Sync {
     /// Process a message through this stage
     async fn process(&self, ctx: &StageContext, msg: Value)
-        -> Result<StageResult, ProcessingError>;
+    -> Result<StageResult, ProcessingError>;
 
     /// Stage name for metrics/logging
     #[allow(dead_code)]
@@ -131,33 +132,44 @@ impl Pipeline {
         msg: Value,
     ) -> Result<Vec<Value>, ProcessingError> {
         let mut current_messages = vec![msg];
+        info!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, initial_messages = current_messages.len(), "starting pipeline execution");
 
-        for stage in &self.stages {
+        for (stage_idx, stage) in self.stages.iter().enumerate() {
             let mut next_messages = Vec::new();
+            let messages_entering_stage = current_messages.len();
+            info!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, stage_index = stage_idx, messages_entering = messages_entering_stage, "processing stage");
 
             for msg in current_messages {
                 let result = stage.process(ctx, msg).await?;
                 match result {
-                    StageResult::Continue(new_msg) => next_messages.push(new_msg),
+                    StageResult::Continue(new_msg) => {
+                        debug!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, stage_index = stage_idx, "message continued to next stage");
+                        next_messages.push(new_msg);
+                    }
                     StageResult::Skip => {
-                        // Skip this message
+                        info!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, stage_index = stage_idx, "message skipped");
                     }
                     StageResult::Split(msgs) => {
+                        info!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, stage_index = stage_idx, split_count = msgs.len(), "message split");
                         next_messages.extend(msgs);
                     }
                     StageResult::Error(err) => {
+                        error!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, stage_index = stage_idx, stage_name = %stage.name(), error = ?err, "stage produced error");
                         return Err(ProcessingError::Stage(err));
                     }
                 }
             }
 
+            info!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, stage_index = stage_idx, messages_entering = messages_entering_stage, messages_exiting = next_messages.len(), "stage processing completed");
             current_messages = next_messages;
 
             if current_messages.is_empty() {
+                info!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, stage_index = stage_idx, "pipeline halted: no messages left after stage");
                 break;
             }
         }
 
+        info!(pipeline = %ctx.pipeline_name, context = %ctx.correlation_id, final_message_count = current_messages.len(), "pipeline execution finished");
         Ok(current_messages)
     }
 }
@@ -280,6 +292,80 @@ impl BatchingConfig {
     }
 }
 
+/// Multi-tenancy configuration for a pipeline.
+///
+/// Enables tenant-aware message routing and rate limiting for multi-tenant deployments.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct MultiTenancyConfig {
+    /// Field name in the message that contains the tenant ID.
+    ///
+    /// This field will be extracted from each message and used for:
+    /// - Routing to tenant-specific staging tables
+    /// - Applying per-tenant rate limits
+    /// - Tracking tenant-specific offsets
+    pub tenant_field: String,
+
+    /// Whether to append tenant ID to the staging table name.
+    ///
+    /// If true, messages for tenant "acme" will be written to "stg_orders_acme"
+    /// instead of "stg_orders". Allows each tenant to have their own physical table.
+    /// Default: false (all tenants write to same staging_table + tenant_id column).
+    #[serde(default)]
+    pub table_suffix_enabled: bool,
+
+    /// Default table name suffix if table_suffix_enabled is true.
+    ///
+    /// When table_suffix_enabled=true, the actual table name becomes:
+    /// `{staging_table}_{tenant_table_suffix_prefix}{tenant_id}`
+    ///
+    /// For example, if staging_table="stg_orders" and tenant_table_suffix_prefix="_",
+    /// then tenant "acme" writes to "stg_orders_acme".
+    #[serde(default = "MultiTenancyConfig::default_table_suffix_prefix")]
+    pub table_suffix_prefix: String,
+
+    /// Maximum messages per second per tenant.
+    ///
+    /// Applies per-tenant rate limiting. If a tenant exceeds this rate,
+    /// messages are backpressured (may be rejected or delayed).
+    /// Default: 10000 (unlimited for most cases).
+    #[serde(default = "MultiTenancyConfig::default_max_messages_per_sec")]
+    pub max_messages_per_sec: u32,
+
+    /// Maximum bytes per second per tenant.
+    ///
+    /// Applies per-tenant rate limiting at the byte level.
+    /// Default: 100MB/s.
+    #[serde(default = "MultiTenancyConfig::default_max_bytes_per_sec")]
+    pub max_bytes_per_sec: u64,
+
+    /// Optional per-tenant rate limit overrides.
+    ///
+    /// Map of tenant_id -> {max_messages_per_sec, max_bytes_per_sec}.
+    /// If a tenant is listed here, its custom limit overrides the defaults.
+    #[serde(default)]
+    pub tenant_limits: std::collections::HashMap<String, TenantLimitOverride>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct TenantLimitOverride {
+    pub max_messages_per_sec: Option<u32>,
+    pub max_bytes_per_sec: Option<u64>,
+}
+
+impl MultiTenancyConfig {
+    fn default_table_suffix_prefix() -> String {
+        "_".to_string()
+    }
+
+    fn default_max_messages_per_sec() -> u32 {
+        10000
+    }
+
+    fn default_max_bytes_per_sec() -> u64 {
+        100_000_000 // 100 MB/s
+    }
+}
+
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct PipelineConfig {
     pub name: String,
@@ -294,6 +380,44 @@ pub struct PipelineConfig {
     pub backpressure: BackpressureConfig,
     #[serde(default)]
     pub batching: BatchingConfig,
+    /// Circuit breaker configuration for fault tolerance.
+    ///
+    /// Controls the behavior of the circuit breaker mechanism, which protects the pipeline from cascading failures.
+    /// The circuit breaker operates in three states: Closed (normal operation), Open (fast-fail to prevent overload),
+    /// and Half-Open (testing recovery). See [`crate::circuit_breaker::CircuitBreakerConfig`] for state details,
+    /// failure/success thresholds, and recovery timeout settings.
+    ///
+    /// # Default Behavior
+    ///
+    /// If not specified, uses [`CircuitBreakerConfig::default`] with: enabled=true, failure_threshold=10,
+    /// success_threshold=5, half_open_timeout_ms=30000.
+    #[serde(default)]
+    pub circuit_breaker: crate::circuit_breaker::CircuitBreakerConfig,
+    /// Number of concurrent worker threads for pipeline message processing.
+    ///
+    /// Controls the parallelism level for processing messages through this pipeline:
+    /// - **1 (default)**: Sequential processing, strict per-partition ordering preserved.
+    /// - **>1**: Parallel message processing with specified thread count. Note: ordering across messages
+    ///   in the same partition is NOT guaranteed with multiple threads (messages are distributed via round-robin).
+    ///   Use this for throughput optimization when ordering is not critical.
+    ///
+    /// # Valid Range
+    ///
+    /// Must be >= 1 (0 or negative values are rejected during config validation).
+    /// **Recommended values:** 1–8 for most use cases; larger values (8–16) for high-throughput scenarios
+    /// with external ordering mechanisms or when key-based sharding is implemented upstream.
+    ///
+    /// # Default
+    ///
+    /// 1 (sequential processing, total ordering preserved).
+    #[serde(default = "PipelineConfig::default_worker_threads")]
+    pub worker_threads: usize,
+    /// Multi-tenancy configuration for this pipeline.
+    ///
+    /// Controls how messages are routed to tenant-specific tables and rate-limited per tenant.
+    /// If not specified, all messages go to the default staging_table and no per-tenant rate limiting is applied.
+    #[serde(default)]
+    pub multi_tenancy: Option<MultiTenancyConfig>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -315,6 +439,14 @@ impl BackpressureConfig {
 
     pub fn default_channel_capacity() -> usize {
         Self::DEFAULT_CHANNEL_CAPACITY
+    }
+}
+
+impl PipelineConfig {
+    pub const DEFAULT_WORKER_THREADS: usize = 1;
+
+    pub fn default_worker_threads() -> usize {
+        Self::DEFAULT_WORKER_THREADS
     }
 }
 
@@ -507,6 +639,9 @@ mod tests {
                 channel_capacity: 100,
             },
             batching: Default::default(),
+            circuit_breaker: Default::default(),
+            worker_threads: 1,
+            multi_tenancy: None,
         };
 
         let pipeline = Pipeline::from_config(&config).unwrap();
@@ -548,6 +683,9 @@ mod tests {
                 channel_capacity: 100,
             },
             batching: Default::default(),
+            circuit_breaker: Default::default(),
+            worker_threads: 1,
+            multi_tenancy: None,
         };
 
         let pipeline = Pipeline::from_config(&config).unwrap();
@@ -602,6 +740,9 @@ mod tests {
                 channel_capacity: 100,
             },
             batching: Default::default(),
+            circuit_breaker: Default::default(),
+            worker_threads: 1,
+            multi_tenancy: None,
         };
 
         let pipeline = Pipeline::from_config(&config).unwrap();
@@ -657,6 +798,9 @@ mod tests {
                 channel_capacity: 100,
             },
             batching: Default::default(),
+            circuit_breaker: Default::default(),
+            worker_threads: 1,
+            multi_tenancy: None,
         };
 
         let pipeline = Pipeline::from_config(&config).unwrap();
@@ -734,6 +878,9 @@ mod tests {
                 channel_capacity: 100,
             },
             batching: Default::default(),
+            circuit_breaker: Default::default(),
+            worker_threads: 1,
+            multi_tenancy: None,
         };
 
         let original_pipeline = Pipeline::from_config(&config).unwrap();
@@ -873,6 +1020,9 @@ mod tests {
                 channel_capacity: 100,
             },
             batching: Default::default(),
+            circuit_breaker: Default::default(),
+            worker_threads: 1,
+            multi_tenancy: None,
         };
 
         // Manually create a pipeline with our error stage
@@ -917,6 +1067,9 @@ mod tests {
                 channel_capacity: 100,
             },
             batching: Default::default(),
+            circuit_breaker: Default::default(),
+            worker_threads: 1,
+            multi_tenancy: None,
         };
 
         let pipeline = Pipeline::from_config(&config).unwrap();
